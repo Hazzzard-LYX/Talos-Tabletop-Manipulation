@@ -12,7 +12,7 @@ ObjectShape = Literal["cube", "sphere"]
 # The table is deliberately a floating fixed cuboid without legs. Its front
 # edge is 0.40 m in front of the robot origin, leaving knee clearance while the
 # 0.80 m top surface stays slightly below the nominal 0.893 m grasp centers.
-TABLE_TOP_HEIGHT_M = 0.80
+TABLE_TOP_HEIGHT_M = 0.86
 TABLE_TOP_HALF_SIZE_M = (0.35, 0.60, 0.04)
 TABLE_CENTER_X_M = 0.75
 

@@ -540,12 +540,22 @@ def talos_tabletop_grasp_env_cfg(
     reduce="netforce",
     num_slots=1,
   )
-  non_hand_pattern = (
+  # Feet and ankle bodies must remain legal terrain contacts.  The previous
+  # broad ``leg_.*_link`` expression included both feet and reset every world
+  # as soon as the robot landed after initialization.
+  illegal_ground_pattern = (
+    r"^(base_link|torso_.*_link|head_.*_link|leg_.*_4_link|arm_.*_(5|7)_link)$"
+  )
+  illegal_table_pattern = (
     r"^(base_link|torso_.*_link|head_.*_link|leg_.*_link|arm_.*_link)$"
   )
   body_ground = ContactSensorCfg(
     name="body_ground_contact",
-    primary=ContactMatch(mode="body", pattern=non_hand_pattern, entity="robot"),
+    primary=ContactMatch(
+      mode="body",
+      pattern=illegal_ground_pattern,
+      entity="robot",
+    ),
     secondary=ContactMatch(mode="body", pattern="terrain"),
     fields=("found",),
     reduce="none",
@@ -553,7 +563,11 @@ def talos_tabletop_grasp_env_cfg(
   )
   body_table = ContactSensorCfg(
     name="body_table_contact",
-    primary=ContactMatch(mode="body", pattern=non_hand_pattern, entity="robot"),
+    primary=ContactMatch(
+      mode="body",
+      pattern=illegal_table_pattern,
+      entity="robot",
+    ),
     secondary=ContactMatch(mode="body", pattern="table", entity="table"),
     fields=("found",),
     reduce="none",

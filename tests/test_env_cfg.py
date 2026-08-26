@@ -1,3 +1,5 @@
+import re
+
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from talos_tabletop.tasks.tabletop.env_cfg import (
   talos_tabletop_grasp_env_cfg,
@@ -50,3 +52,9 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert {"approach_object", "multi_link_contact", "lift_progress"} <= set(
     cfg.rewards
   )
+
+  body_ground = next(
+    sensor for sensor in cfg.scene.sensors if sensor.name == "body_ground_contact"
+  )
+  assert re.fullmatch(body_ground.primary.pattern, "leg_left_4_link")
+  assert not re.fullmatch(body_ground.primary.pattern, "leg_left_6_link")
