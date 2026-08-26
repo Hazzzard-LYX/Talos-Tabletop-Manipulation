@@ -2,7 +2,7 @@
 #SBATCH --job-name=talos-table-live
 #SBATCH --output=/home/stud_yuxuan1/IAS_Workspace/logs/%x-%j.out
 #SBATCH --error=/home/stud_yuxuan1/IAS_Workspace/logs/%x-%j.err
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --partition=stud

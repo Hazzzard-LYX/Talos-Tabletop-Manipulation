@@ -47,7 +47,7 @@ uv run pytest
 
 项目使用 IAS Cluster 已验证的共享 MJLab 环境，不构建新镜像。项目专用脚本位于 `slurm/`：
 
-- `mjlab-grasp-train.sbatch`：默认在一张 RTX 2080 上训练 256 个立方体抓取环境；
+- `mjlab-grasp-train.sbatch`：默认在学生分区的一张可用 GPU 上训练 256 个立方体抓取环境；
 - `mjlab-grasp-livestream.sbatch`：等待第 25 个 checkpoint，并在独立 CPU 作业中打开一个 Viser 环境；
 - `play_grasp_livestream.py`：加载 actor checkpoint 的可视化入口。
 

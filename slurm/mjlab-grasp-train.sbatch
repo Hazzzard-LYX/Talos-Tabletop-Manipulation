@@ -2,11 +2,11 @@
 #SBATCH --job-name=talos-table-grasp
 #SBATCH --output=/home/stud_yuxuan1/IAS_Workspace/logs/%x-%j.out
 #SBATCH --error=/home/stud_yuxuan1/IAS_Workspace/logs/%x-%j.err
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --partition=stud
-#SBATCH --gres=gpu:rtx2080:1
+#SBATCH --gres=gpu:1
 
 set -euo pipefail
 
