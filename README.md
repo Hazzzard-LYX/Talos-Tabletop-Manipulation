@@ -49,6 +49,7 @@ uv run pytest
 
 - `mjlab-grasp-train.sbatch`：默认在学生分区的一张可用 GPU 上训练 256 个立方体抓取环境；
 - `mjlab-grasp-livestream.sbatch`：等待第 25 个 checkpoint，并在独立 CPU 作业中打开一个 Viser 环境；
+- `train_grasp.py`：从源码 checkout 显式注册项目任务后进入 MJLab 训练 CLI；
 - `play_grasp_livestream.py`：加载 actor checkpoint 的可视化入口。
 
 两个作业都通过 SLURM 运行，livestream 默认监听计算节点的 `18080` 端口，需从本地经登录节点建立 SSH tunnel。

@@ -39,7 +39,7 @@ nvidia-smi
 
 test -x "${PYTHON}"
 cd "${PROJECT_ROOT}"
-"${PYTHON}" -m mjlab.scripts.train "${TASK}" \
+"${PYTHON}" slurm/train_grasp.py "${TASK}" \
   --env.scene.num-envs "${NUM_ENVS}" \
   --env.seed "${SEED}" \
   --agent.seed "${SEED}" \
