@@ -84,6 +84,7 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
     "grasp_lift_success",
   )
   assert curriculum_params["promotion_success_rates"] == (0.80, 0.70, 0.60)
+  assert curriculum_params["initial_stage"] == 0
   assert len(curriculum_params["stage_reward_weights"]) == 4
   assert all("step" not in key for key in curriculum_params)
   navigation_weights = curriculum_params["stage_reward_weights"][1]

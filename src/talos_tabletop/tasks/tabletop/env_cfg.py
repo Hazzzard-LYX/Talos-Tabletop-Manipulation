@@ -902,6 +902,7 @@ def talos_tabletop_grasp_env_cfg(
         ),
         "promotion_success_rates": (0.80, 0.70, 0.60),
         "evaluation_episodes": (4096, 4096, 4096),
+        "initial_stage": 0,
         "stage_termination_params": (
           {"object_lost": {"minimum_height": -10.0}},
           {"object_lost": {"minimum_height": -10.0}},
