@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -54,6 +55,11 @@ def base_motion_l2(
   """Penalize root linear and angular motion while manipulating in place."""
   asset: Entity = env.scene[asset_cfg.name]
   return torch.sum(torch.square(asset.data.root_link_vel_w), dim=1)
+
+
+def action_magnitude_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Penalize the applied normalized action, including constant saturation."""
+  return torch.sum(torch.square(env.action_manager.action), dim=1)
 
 
 def joint_deviation_l2(
@@ -158,8 +164,247 @@ def both_feet_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
     raise TypeError(f"'{sensor_name}' must provide ContactSensor found data.")
   found = sensor.data.found > 0
   num_slots = sensor.cfg.num_slots
-  per_foot = found.reshape(env.num_envs, len(sensor.primary_names), num_slots).any(dim=2)
+  per_foot = found.reshape(env.num_envs, len(sensor.primary_names), num_slots).any(
+    dim=2
+  )
   return per_foot.all(dim=1).float()
+
+
+def _stable_standing_mask(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  maximum_projected_gravity_xy: float,
+  maximum_linear_speed: float,
+  maximum_angular_speed: float,
+  asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  asset: Entity = env.scene[asset_cfg.name]
+  feet = both_feet_contact(env, sensor_name) > 0.5
+  tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
+  lin_speed = torch.linalg.vector_norm(asset.data.root_link_vel_w[:, :3], dim=1)
+  ang_speed = torch.linalg.vector_norm(asset.data.root_link_vel_w[:, 3:], dim=1)
+  return (
+    feet
+    & (tilt <= maximum_projected_gravity_xy)
+    & (lin_speed <= maximum_linear_speed)
+    & (ang_speed <= maximum_angular_speed)
+  )
+
+
+class sustained_standing_success:
+  """Sparse success after continuously satisfying a stable standing condition."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._required_steps = max(
+      1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
+    )
+    self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    required_duration_s: float,
+    maximum_projected_gravity_xy: float,
+    maximum_linear_speed: float,
+    maximum_angular_speed: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    del required_duration_s
+    stable = _stable_standing_mask(
+      env,
+      sensor_name,
+      maximum_projected_gravity_xy,
+      maximum_linear_speed,
+      maximum_angular_speed,
+      asset_cfg,
+    )
+    self._counter = torch.where(stable, self._counter + 1, 0)
+    success = self._counter >= self._required_steps
+    env.extras["log"]["Metrics/standing_success"] = success.float().mean()
+    return success.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._counter[env_ids] = 0
+
+
+def base_target_distance_tanh(
+  env: ManagerBasedRlEnv,
+  target_position: tuple[float, float],
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Dense navigation reward for moving the base to an environment-local target."""
+  asset: Entity = env.scene[asset_cfg.name]
+  target_xy = torch.tensor(
+    target_position, device=env.device, dtype=torch.float
+  ).repeat(env.num_envs, 1)
+  target_xy += env.scene.env_origins[:, :2]
+  distance = torch.linalg.vector_norm(
+    asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
+  )
+  env.extras["log"]["Metrics/base_target_distance_m"] = distance.mean()
+  return 1.0 - torch.tanh(distance / std)
+
+
+class base_target_progress:
+  """Reward radial velocity toward the planar navigation target.
+
+  Reward terms are multiplied by ``env.step_dt`` by the manager.  Dividing the
+  per-step distance reduction here makes the integrated episode reward equal
+  to weighted path progress instead of shrinking it by a second factor of dt.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self._previous_distance = torch.full(
+      (env.num_envs,), float("nan"), device=env.device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    target_position: tuple[float, float],
+    maximum_speed: float,
+    maximum_projected_gravity_xy: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    target_xy = torch.tensor(
+      target_position, device=env.device, dtype=torch.float
+    ).repeat(env.num_envs, 1)
+    target_xy += env.scene.env_origins[:, :2]
+    distance = torch.linalg.vector_norm(
+      asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
+    )
+    initialized = torch.isfinite(self._previous_distance)
+    radial_velocity = torch.where(
+      initialized,
+      (self._previous_distance - distance) / env.step_dt,
+      0.0,
+    )
+    self._previous_distance = distance.detach().clone()
+    radial_velocity = radial_velocity.clamp(-maximum_speed, maximum_speed)
+    tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
+    upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
+    return radial_velocity * upright_scale
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._previous_distance[env_ids] = float("nan")
+
+
+class sustained_navigation_success:
+  """Sparse success for arriving at the table while remaining balanced."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._required_steps = max(
+      1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
+    )
+    self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    target_position: tuple[float, float],
+    distance_threshold: float,
+    required_duration_s: float,
+    maximum_projected_gravity_xy: float,
+    maximum_linear_speed: float,
+    maximum_angular_speed: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    del required_duration_s
+    asset: Entity = env.scene[asset_cfg.name]
+    target_xy = torch.tensor(
+      target_position, device=env.device, dtype=torch.float
+    ).repeat(env.num_envs, 1)
+    target_xy += env.scene.env_origins[:, :2]
+    close = (
+      torch.linalg.vector_norm(asset.data.root_link_pos_w[:, :2] - target_xy, dim=1)
+      <= distance_threshold
+    )
+    stable = _stable_standing_mask(
+      env,
+      sensor_name,
+      maximum_projected_gravity_xy,
+      maximum_linear_speed,
+      maximum_angular_speed,
+      asset_cfg,
+    )
+    self._counter = torch.where(close & stable, self._counter + 1, 0)
+    success = self._counter >= self._required_steps
+    env.extras["log"]["Metrics/navigation_success"] = success.float().mean()
+    return success.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._counter[env_ids] = 0
+
+
+def object_target_distance_tanh(
+  env: ManagerBasedRlEnv,
+  target_position: tuple[float, float, float],
+  std: float,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Dense transport reward from the object center to its placement target."""
+  obj: Entity = env.scene[object_cfg.name]
+  target_w = torch.tensor(target_position, device=env.device, dtype=torch.float).repeat(
+    env.num_envs, 1
+  )
+  target_w += env.scene.env_origins
+  distance = torch.linalg.vector_norm(obj.data.root_link_pos_w - target_w, dim=1)
+  env.extras["log"]["Metrics/object_target_distance_m"] = distance.mean()
+  return 1.0 - torch.tanh(distance / std)
+
+
+class place_object_success:
+  """Reward lifting, transporting, and releasing the object in the target zone."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self._lifted = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    initial_center_height: float,
+    minimum_lift_height: float,
+    target_position: tuple[float, float, float],
+    target_xy_tolerance: float,
+    target_height_tolerance: float,
+    maximum_release_contacts: int = 0,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    sensor = env.scene[sensor_name]
+    if not isinstance(sensor, ContactSensor) or sensor.data.found is None:
+      raise TypeError(f"'{sensor_name}' must provide ContactSensor found data.")
+    obj: Entity = env.scene[object_cfg.name]
+    self._lifted |= (
+      obj.data.root_link_pos_w[:, 2] - initial_center_height
+    ) >= minimum_lift_height
+
+    target_w = torch.tensor(
+      target_position, device=env.device, dtype=torch.float
+    ).repeat(env.num_envs, 1)
+    target_w += env.scene.env_origins
+    target_xy_error = torch.linalg.vector_norm(
+      obj.data.root_link_pos_w[:, :2] - target_w[:, :2], dim=1
+    )
+    target_height_error = torch.abs(obj.data.root_link_pos_w[:, 2] - target_w[:, 2])
+    contacts = sensor.data.found.sum(dim=1)
+    success = (
+      self._lifted
+      & (target_xy_error <= target_xy_tolerance)
+      & (target_height_error <= target_height_tolerance)
+      & (contacts <= maximum_release_contacts)
+    )
+    env.extras["log"]["Metrics/place_success"] = success.float().mean()
+    return success.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._lifted[env_ids] = False
 
 
 def position_command_error_tanh(

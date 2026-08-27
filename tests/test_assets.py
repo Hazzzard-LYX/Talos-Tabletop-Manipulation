@@ -6,6 +6,7 @@ from talos_tabletop.assets import (
   OBJECT_MASS_KG,
   SPHERE_RADIUS_M,
   TABLE_TOP_HALF_SIZE_M,
+  TABLE_TOP_HEIGHT_M,
   get_object_spec,
   get_table_spec,
 )
@@ -26,6 +27,7 @@ def test_migrated_talos_grippers_compile_with_real_coupling() -> None:
   )
   assert model.geom("head_1_collision").type == mujoco.mjtGeom.mjGEOM_MESH
   assert model.geom("head_2_collision").type == mujoco.mjtGeom.mjGEOM_MESH
+  assert tuple(model.qpos0[:3]) == pytest.approx((0.0, 0.0, 1.0))
 
 
 def test_table_is_fixed_and_has_visual_task_zones() -> None:
@@ -37,6 +39,7 @@ def test_table_is_fixed_and_has_visual_task_zones() -> None:
   assert table.site("target_zone").id >= 0
   # Zones are sites rather than geoms, so they cannot create contacts.
   assert table.ngeom == 1
+  assert TABLE_TOP_HEIGHT_M == pytest.approx(0.86)
 
 
 @pytest.mark.parametrize(

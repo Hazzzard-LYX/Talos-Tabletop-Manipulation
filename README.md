@@ -9,7 +9,7 @@
 - 从 `WBC-For-Talos` 复制了已验证的 TALOS MJCF/STL；
 - 保留真实单电机三指耦合、手指接触 mesh、头部碰撞 mesh；
 - 保留腕部/踝部 F/T 传感器和真实执行器限制；
-- 新增无桌腿的固定悬浮桌面、绿色取物区和红色放置区；
+- 新增顶面高度 0.86 m 的无桌腿固定悬浮桌面、绿色取物区和红色放置区；
 - 新增蓝色 60 mm 立方体和 70 mm 球体任务；
 - 抓取 policy 控制双腿、躯干、双臂和右夹爪，自主维持原地平衡；
 - actor 与 critic 首版直接接收物体中心真值，后续保持三维接口不变并替换为视觉估计；
@@ -42,6 +42,17 @@ uv sync --extra cpu
 uv run ruff check .
 uv run pytest
 ```
+
+## 集群小规模训练与可视化
+
+项目使用 IAS Cluster 已验证的共享 MJLab 环境，不构建新镜像。项目专用脚本位于 `slurm/`：
+
+- `mjlab-grasp-train.sbatch`：默认在学生分区的一张可用 GPU 上训练 256 个立方体抓取环境；
+- `mjlab-grasp-livestream.sbatch`：等待第 25 个 checkpoint，并在独立 CPU 作业中打开一个 Viser 环境；
+- `train_grasp.py`：从源码 checkout 显式注册项目任务后进入 MJLab 训练 CLI；
+- `play_grasp_livestream.py`：加载 actor checkpoint 的可视化入口。
+
+两个作业都通过 SLURM 运行，livestream 默认监听计算节点的 `18080` 端口，需从本地经登录节点建立 SSH tunnel。
 
 ## 设计原则
 

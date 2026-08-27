@@ -21,7 +21,10 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 from talos_tabletop.assets import (
+  TABLE_CENTER_X_M,
+  TABLE_TOP_HALF_SIZE_M,
   TABLE_TOP_HEIGHT_M,
+  TARGET_ZONE_CENTER_M,
   ObjectShape,
   get_object_cfg,
   get_table_cfg,
@@ -33,6 +36,16 @@ from talos_tabletop.robots import (
   get_talos_grasping_robot_cfg,
 )
 from talos_tabletop.tasks.tabletop import mdp
+
+TABLE_FRONT_X_M = TABLE_CENTER_X_M - TABLE_TOP_HALF_SIZE_M[0]
+ROBOT_TABLE_CLEARANCE_M = 3.0
+ROBOT_SPAWN_POSITION_M = (
+  TABLE_FRONT_X_M - ROBOT_TABLE_CLEARANCE_M,
+  0.0,
+  1.0,
+)
+TABLE_APPROACH_BASE_XY_M = (0.0, 0.0)
+MAX_COLLISION_OBSTACLES = 8
 
 
 def make_tabletop_reaching_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -52,6 +65,14 @@ def make_tabletop_reaching_env_cfg() -> ManagerBasedRlEnvCfg:
       noise=Unoise(n_min=-1.5, n_max=1.5),
     ),
     "actions": ObservationTermCfg(func=mdp.last_action),
+    "collision_obstacle_boxes_b": ObservationTermCfg(
+      func=mdp.obstacle_boxes_in_robot_frame,
+      params={
+        "obstacle_names": ("table",),
+        "half_extents": (TABLE_TOP_HALF_SIZE_M,),
+        "max_obstacles": MAX_COLLISION_OBSTACLES,
+      },
+    ),
     "pose_command_left": ObservationTermCfg(
       func=mdp.commands_gen,
       params={"command_name": "pose_command_left"},
@@ -126,8 +147,17 @@ def make_tabletop_reaching_env_cfg() -> ManagerBasedRlEnvCfg:
   ## --------------------------------------------------------
 
   events = {
+    "reset_robot_root": EventTermCfg(
+      func=mdp.reset_root_state_uniform,
+      mode="reset",
+      params={
+        "pose_range": {},
+        "velocity_range": {},
+        "asset_cfg": SceneEntityCfg("robot"),
+      },
+    ),
     "reset_robot_joints": EventTermCfg(
-      func=mdp.reset_joints_by_offset,
+      func=mdp.reset_joints_by_offset_broadcast,
       mode="reset",
       params={
         "position_range": (0.1, 0.1),
@@ -276,6 +306,10 @@ def make_tabletop_reaching_env_cfg() -> ManagerBasedRlEnvCfg:
         max_init_terrain_level=5,
       ),
       num_envs=1,
+      # MuJoCo-Warp environments are independent worlds.  Keeping every
+      # environment in the same local frame makes the fixed table, floating
+      # robot, object resets, and reward targets use identical coordinates.
+      env_spacing=0.0,
       extent=2.0,
     ),
     observations=observations,
@@ -438,8 +472,10 @@ def talos_tabletop_grasp_env_cfg(
   the three-dimensional policy interface.
   """
   cfg = make_tabletop_reaching_env_cfg()
+  robot_cfg = get_talos_grasping_robot_cfg()
+  robot_cfg.init_state.pos = ROBOT_SPAWN_POSITION_M
   cfg.scene.entities = {
-    "robot": get_talos_grasping_robot_cfg(),
+    "robot": robot_cfg,
     "table": get_table_cfg(),
     "object": get_object_cfg(object_shape),
   }
@@ -449,7 +485,15 @@ def talos_tabletop_grasp_env_cfg(
   cfg.sim.contact_sensor_maxmatch = 256
   cfg.sim.mujoco.ccd_iterations = 100
   cfg.viewer.body_name = "torso_2_link"
-  cfg.episode_length_s = 10.0
+  cfg.viewer.distance = 6.0
+  cfg.episode_length_s = 30.0
+
+  initial_center_height = object_initial_position(object_shape)[2]
+  placement_target = (
+    TARGET_ZONE_CENTER_M[0],
+    TARGET_ZONE_CENTER_M[1],
+    initial_center_height,
+  )
 
   # No random Cartesian reach target is needed: the object center is the goal.
   cfg.commands = {}
@@ -470,6 +514,20 @@ def talos_tabletop_grasp_env_cfg(
       ),
       "privileged_object_center_b": ObservationTermCfg(
         func=mdp.object_position_in_robot_frame,
+      ),
+      "table_approach_target_b": ObservationTermCfg(
+        func=mdp.point_in_robot_frame,
+        params={
+          "point": (
+            TABLE_APPROACH_BASE_XY_M[0],
+            TABLE_APPROACH_BASE_XY_M[1],
+            ROBOT_SPAWN_POSITION_M[2],
+          )
+        },
+      ),
+      "placement_target_b": ObservationTermCfg(
+        func=mdp.point_in_robot_frame,
+        params={"point": placement_target},
       ),
     }
   )
@@ -498,7 +556,9 @@ def talos_tabletop_grasp_env_cfg(
 
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.02, 0.02),
+      # Match the validated WBC grasp setup exactly during the initial
+      # balance curriculum instead of perturbing the unsupported landing.
+      "position_range": (0.0, 0.0),
       "velocity_range": (0.0, 0.0),
     }
   )
@@ -516,9 +576,11 @@ def talos_tabletop_grasp_env_cfg(
     },
   )
 
-  right_hand_pattern = "^(" + "|".join(
-    name for name in TALOS_GRIPPER_CONTACT_BODY_NAMES if "_right_" in name
-  ) + ")$"
+  right_hand_pattern = (
+    "^("
+    + "|".join(name for name in TALOS_GRIPPER_CONTACT_BODY_NAMES if "_right_" in name)
+    + ")$"
+  )
   right_contact = ContactSensorCfg(
     name="right_gripper_object_contact",
     primary=ContactMatch(mode="body", pattern=right_hand_pattern, entity="robot"),
@@ -540,12 +602,22 @@ def talos_tabletop_grasp_env_cfg(
     reduce="netforce",
     num_slots=1,
   )
-  non_hand_pattern = (
+  # Feet and ankle bodies must remain legal terrain contacts.  The previous
+  # broad ``leg_.*_link`` expression included both feet and reset every world
+  # as soon as the robot landed after initialization.
+  illegal_ground_pattern = (
+    r"^(base_link|torso_.*_link|head_.*_link|leg_.*_4_link|arm_.*_(5|7)_link)$"
+  )
+  illegal_table_pattern = (
     r"^(base_link|torso_.*_link|head_.*_link|leg_.*_link|arm_.*_link)$"
   )
   body_ground = ContactSensorCfg(
     name="body_ground_contact",
-    primary=ContactMatch(mode="body", pattern=non_hand_pattern, entity="robot"),
+    primary=ContactMatch(
+      mode="body",
+      pattern=illegal_ground_pattern,
+      entity="robot",
+    ),
     secondary=ContactMatch(mode="body", pattern="terrain"),
     fields=("found",),
     reduce="none",
@@ -553,7 +625,11 @@ def talos_tabletop_grasp_env_cfg(
   )
   body_table = ContactSensorCfg(
     name="body_table_contact",
-    primary=ContactMatch(mode="body", pattern=non_hand_pattern, entity="robot"),
+    primary=ContactMatch(
+      mode="body",
+      pattern=illegal_table_pattern,
+      entity="robot",
+    ),
     secondary=ContactMatch(mode="body", pattern="table", entity="table"),
     fields=("found",),
     reduce="none",
@@ -561,13 +637,13 @@ def talos_tabletop_grasp_env_cfg(
   )
   cfg.scene.sensors = (right_contact, feet_ground, body_ground, body_table)
 
-  initial_center_height = object_initial_position(object_shape)[2]
   lower_body = SceneEntityCfg("robot", joint_names=(r"leg_.*_joint",))
   left_arm = SceneEntityCfg("robot", joint_names=(r"arm_left_.*_joint",))
+  right_arm = SceneEntityCfg("robot", joint_names=(r"arm_right_.*_joint",))
   cfg.rewards = {
     "upright": RewardTermCfg(
       func=mdp.upright,
-      weight=2.0,
+      weight=4.0,
       params={
         "std": 0.30,
         "asset_cfg": SceneEntityCfg("robot", body_names=("torso_2_link",)),
@@ -575,13 +651,51 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "both_feet_contact": RewardTermCfg(
       func=mdp.both_feet_contact,
-      weight=0.5,
+      weight=2.0,
       params={"sensor_name": feet_ground.name},
+    ),
+    "standing_success": RewardTermCfg(
+      func=mdp.sustained_standing_success,
+      weight=5.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "required_duration_s": 3.0,
+        "maximum_projected_gravity_xy": 0.20,
+        "maximum_linear_speed": 0.25,
+        "maximum_angular_speed": 0.35,
+      },
     ),
     "base_motion": RewardTermCfg(func=mdp.base_motion_l2, weight=-0.10),
     "base_drift": RewardTermCfg(
       func=mdp.base_position_deviation_l2,
-      weight=-2.0,
+      weight=-4.0,
+    ),
+    "navigate_to_table": RewardTermCfg(
+      func=mdp.base_target_distance_tanh,
+      weight=0.0,
+      params={"target_position": TABLE_APPROACH_BASE_XY_M, "std": 3.0},
+    ),
+    "navigation_progress": RewardTermCfg(
+      func=mdp.base_target_progress,
+      weight=0.0,
+      params={
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "maximum_speed": 0.5,
+        "maximum_projected_gravity_xy": 0.70,
+      },
+    ),
+    "reach_table_success": RewardTermCfg(
+      func=mdp.sustained_navigation_success,
+      weight=0.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "distance_threshold": 0.35,
+        "required_duration_s": 1.0,
+        "maximum_projected_gravity_xy": 0.25,
+        "maximum_linear_speed": 0.30,
+        "maximum_angular_speed": 0.40,
+      },
     ),
     "lower_body_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
@@ -590,17 +704,22 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "left_arm_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
-      weight=-0.1,
+      weight=-0.5,
       params={"asset_cfg": left_arm},
+    ),
+    "right_arm_pose": RewardTermCfg(
+      func=mdp.joint_deviation_l2,
+      weight=-0.5,
+      params={"asset_cfg": right_arm},
     ),
     "approach_object": RewardTermCfg(
       func=mdp.site_object_distance_tanh,
-      weight=2.0,
+      weight=0.0,
       params={"site_name": "right_grasp_center", "std": 0.15},
     ),
     "multi_link_contact": RewardTermCfg(
       func=mdp.gripper_object_contact,
-      weight=3.0,
+      weight=0.0,
       params={
         "sensor_name": right_contact.name,
         "contacts_for_full_reward": 2,
@@ -608,7 +727,7 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "lift_progress": RewardTermCfg(
       func=mdp.object_lift_progress,
-      weight=8.0,
+      weight=0.0,
       params={
         "initial_center_height": initial_center_height,
         "target_lift_height": 0.10,
@@ -616,7 +735,7 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "grasp_lift_success": RewardTermCfg(
       func=mdp.grasp_and_lift_success,
-      weight=5.0,
+      weight=0.0,
       params={
         "sensor_name": right_contact.name,
         "initial_center_height": initial_center_height,
@@ -624,8 +743,34 @@ def talos_tabletop_grasp_env_cfg(
         "minimum_contacts": 2,
       },
     ),
+    "object_target": RewardTermCfg(
+      func=mdp.object_target_distance_tanh,
+      weight=0.0,
+      params={"target_position": placement_target, "std": 0.20},
+    ),
+    "place_success": RewardTermCfg(
+      func=mdp.place_object_success,
+      weight=0.0,
+      params={
+        "sensor_name": right_contact.name,
+        "initial_center_height": initial_center_height,
+        "minimum_lift_height": 0.08,
+        "target_position": placement_target,
+        "target_xy_tolerance": 0.08,
+        "target_height_tolerance": 0.04,
+        "maximum_release_contacts": 0,
+      },
+    ),
+    "termination_penalty": RewardTermCfg(
+      func=mdp.is_terminated,
+      weight=-200.0,
+    ),
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
-    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
+    "action_magnitude_l2": RewardTermCfg(
+      func=mdp.action_magnitude_l2,
+      weight=-0.02,
+    ),
+    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.02),
     "joint_vel_hinge": RewardTermCfg(
       func=mdp.joint_velocity_hinge_penalty,
       weight=-0.02,
@@ -655,10 +800,135 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "object_lost": TerminationTermCfg(
       func=mdp.object_height_below,
-      params={"minimum_height": TABLE_TOP_HEIGHT_M - 0.12},
+      params={"minimum_height": -10.0},
     ),
   }
-  cfg.curriculum = {}
+  # The stages are gated only by completed-episode success rates.  Every stage
+  # explicitly sets all mutable weights so a promoted environment cannot retain
+  # stale shaping from the previous stage.
+  safety_weights = {
+    "termination_penalty": -200.0,
+    "dof_pos_limits": -1.0,
+    "action_magnitude_l2": -0.02,
+    "action_rate_l2": -0.02,
+    "joint_vel_hinge": -0.02,
+  }
+  stage_reward_weights = (
+    {
+      **safety_weights,
+      "upright": 4.0,
+      "both_feet_contact": 2.0,
+      "standing_success": 5.0,
+      "base_motion": -0.10,
+      "base_drift": -4.0,
+      "navigate_to_table": 0.0,
+      "navigation_progress": 0.0,
+      "reach_table_success": 0.0,
+      "lower_body_pose": -0.5,
+      "left_arm_pose": -0.5,
+      "right_arm_pose": -0.5,
+      "approach_object": 0.0,
+      "multi_link_contact": 0.0,
+      "lift_progress": 0.0,
+      "grasp_lift_success": 0.0,
+      "object_target": 0.0,
+      "place_success": 0.0,
+    },
+    {
+      **safety_weights,
+      "dof_pos_limits": -1.0,
+      "action_magnitude_l2": -0.005,
+      "action_rate_l2": -0.01,
+      "joint_vel_hinge": -0.01,
+      "upright": 1.5,
+      "both_feet_contact": 0.5,
+      "standing_success": 0.2,
+      "base_motion": 0.0,
+      "base_drift": 0.0,
+      "navigate_to_table": 6.0,
+      "navigation_progress": 6.0,
+      "reach_table_success": 10.0,
+      "lower_body_pose": -0.05,
+      "left_arm_pose": -0.1,
+      "right_arm_pose": -0.1,
+      "approach_object": 0.0,
+      "multi_link_contact": 0.0,
+      "lift_progress": 0.0,
+      "grasp_lift_success": 0.0,
+      "object_target": 0.0,
+      "place_success": 0.0,
+    },
+    {
+      **safety_weights,
+      "upright": 2.0,
+      "both_feet_contact": 1.0,
+      "standing_success": 1.0,
+      "base_motion": -0.05,
+      "base_drift": 0.0,
+      "navigate_to_table": 1.0,
+      "navigation_progress": 1.0,
+      "reach_table_success": 1.0,
+      "lower_body_pose": -0.2,
+      "left_arm_pose": -0.2,
+      "right_arm_pose": -0.1,
+      "approach_object": 4.0,
+      "multi_link_contact": 3.0,
+      "lift_progress": 8.0,
+      "grasp_lift_success": 6.0,
+      "object_target": 0.0,
+      "place_success": 0.0,
+    },
+    {
+      **safety_weights,
+      "upright": 2.0,
+      "both_feet_contact": 1.0,
+      "standing_success": 1.0,
+      "base_motion": -0.05,
+      "base_drift": 0.0,
+      "navigate_to_table": 0.5,
+      "navigation_progress": 0.5,
+      "reach_table_success": 0.5,
+      "lower_body_pose": -0.2,
+      "left_arm_pose": -0.2,
+      "right_arm_pose": -0.1,
+      "approach_object": 1.0,
+      "multi_link_contact": 2.0,
+      "lift_progress": 2.0,
+      "grasp_lift_success": 2.0,
+      "object_target": 5.0,
+      "place_success": 12.0,
+    },
+  )
+  cfg.curriculum = {
+    "task_stage": CurriculumTermCfg(
+      func=mdp.performance_stage_curriculum,
+      params={
+        "stage_reward_weights": stage_reward_weights,
+        "promotion_reward_names": (
+          "standing_success",
+          "reach_table_success",
+          "grasp_lift_success",
+        ),
+        "promotion_success_rates": (0.80, 0.70, 0.60),
+        "evaluation_episodes": (4096, 4096, 4096),
+        "initial_stage": 0,
+        "stage_termination_params": (
+          {"object_lost": {"minimum_height": -10.0}},
+          {"object_lost": {"minimum_height": -10.0}},
+          {
+            "object_lost": {
+              "minimum_height": TABLE_TOP_HEIGHT_M - 0.12,
+            }
+          },
+          {
+            "object_lost": {
+              "minimum_height": TABLE_TOP_HEIGHT_M - 0.12,
+            }
+          },
+        ),
+      },
+    )
+  }
 
   if play:
     cfg.observations["actor"].enable_corruption = False
