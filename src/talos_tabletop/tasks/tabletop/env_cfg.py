@@ -581,7 +581,7 @@ def talos_tabletop_grasp_env_cfg(
   cfg.rewards = {
     "upright": RewardTermCfg(
       func=mdp.upright,
-      weight=2.0,
+      weight=4.0,
       params={
         "std": 0.30,
         "asset_cfg": SceneEntityCfg("robot", body_names=("torso_2_link",)),
@@ -589,13 +589,13 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "both_feet_contact": RewardTermCfg(
       func=mdp.both_feet_contact,
-      weight=0.5,
+      weight=2.0,
       params={"sensor_name": feet_ground.name},
     ),
     "base_motion": RewardTermCfg(func=mdp.base_motion_l2, weight=-0.10),
     "base_drift": RewardTermCfg(
       func=mdp.base_position_deviation_l2,
-      weight=-2.0,
+      weight=-4.0,
     ),
     "lower_body_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
@@ -609,12 +609,12 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "approach_object": RewardTermCfg(
       func=mdp.site_object_distance_tanh,
-      weight=2.0,
+      weight=0.0,
       params={"site_name": "right_grasp_center", "std": 0.15},
     ),
     "multi_link_contact": RewardTermCfg(
       func=mdp.gripper_object_contact,
-      weight=3.0,
+      weight=0.0,
       params={
         "sensor_name": right_contact.name,
         "contacts_for_full_reward": 2,
@@ -622,7 +622,7 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "lift_progress": RewardTermCfg(
       func=mdp.object_lift_progress,
-      weight=8.0,
+      weight=0.0,
       params={
         "initial_center_height": initial_center_height,
         "target_lift_height": 0.10,
@@ -630,7 +630,7 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "grasp_lift_success": RewardTermCfg(
       func=mdp.grasp_and_lift_success,
-      weight=5.0,
+      weight=0.0,
       params={
         "sensor_name": right_contact.name,
         "initial_center_height": initial_center_height,
@@ -639,7 +639,7 @@ def talos_tabletop_grasp_env_cfg(
       },
     ),
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
-    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
+    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.05),
     "joint_vel_hinge": RewardTermCfg(
       func=mdp.joint_velocity_hinge_penalty,
       weight=-0.02,
@@ -672,7 +672,92 @@ def talos_tabletop_grasp_env_cfg(
       params={"minimum_height": TABLE_TOP_HEIGHT_M - 0.12},
     ),
   }
-  cfg.curriculum = {}
+  # One PPO iteration collects 24 environment steps.  First learn a quiet,
+  # balanced landing, then introduce reaching, contact, and finally lifting.
+  steps_per_iteration = 24
+  cfg.curriculum = {
+    "upright": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "upright",
+        "stages": [
+          {"step": 0, "weight": 4.0},
+          {"step": 500 * steps_per_iteration, "weight": 2.0},
+        ],
+      },
+    ),
+    "both_feet_contact": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "both_feet_contact",
+        "stages": [
+          {"step": 0, "weight": 2.0},
+          {"step": 500 * steps_per_iteration, "weight": 0.5},
+        ],
+      },
+    ),
+    "base_drift": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "base_drift",
+        "stages": [
+          {"step": 0, "weight": -4.0},
+          {"step": 500 * steps_per_iteration, "weight": -2.0},
+        ],
+      },
+    ),
+    "action_rate": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "action_rate_l2",
+        "stages": [
+          {"step": 0, "weight": -0.05},
+          {"step": 500 * steps_per_iteration, "weight": -0.02},
+          {"step": 3_000 * steps_per_iteration, "weight": -0.01},
+        ],
+      },
+    ),
+    "approach_object": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "approach_object",
+        "stages": [
+          {"step": 0, "weight": 0.0},
+          {"step": 500 * steps_per_iteration, "weight": 2.0},
+        ],
+      },
+    ),
+    "multi_link_contact": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "multi_link_contact",
+        "stages": [
+          {"step": 0, "weight": 0.0},
+          {"step": 1_500 * steps_per_iteration, "weight": 3.0},
+        ],
+      },
+    ),
+    "lift_progress": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "lift_progress",
+        "stages": [
+          {"step": 0, "weight": 0.0},
+          {"step": 3_000 * steps_per_iteration, "weight": 8.0},
+        ],
+      },
+    ),
+    "grasp_lift_success": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "grasp_lift_success",
+        "stages": [
+          {"step": 0, "weight": 0.0},
+          {"step": 3_000 * steps_per_iteration, "weight": 5.0},
+        ],
+      },
+    ),
+  }
 
   if play:
     cfg.observations["actor"].enable_corruption = False
