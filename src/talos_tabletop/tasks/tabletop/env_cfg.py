@@ -678,8 +678,9 @@ def talos_tabletop_grasp_env_cfg(
       params={"minimum_height": -10.0},
     ),
   }
-  # One PPO iteration collects 24 environment steps.  First learn a quiet,
-  # balanced landing, then introduce reaching, contact, and finally lifting.
+  # One PPO iteration collects 24 environment steps.  Spend the first 3,000
+  # iterations on a quiet, balanced landing, then introduce reaching, contact,
+  # and finally lifting in equally long stages.
   steps_per_iteration = 24
   cfg.curriculum = {
     "upright": CurriculumTermCfg(
@@ -688,7 +689,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "upright",
         "stages": [
           {"step": 0, "weight": 4.0},
-          {"step": 500 * steps_per_iteration, "weight": 2.0},
+          {"step": 3_000 * steps_per_iteration, "weight": 2.0},
         ],
       },
     ),
@@ -698,7 +699,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "both_feet_contact",
         "stages": [
           {"step": 0, "weight": 2.0},
-          {"step": 500 * steps_per_iteration, "weight": 0.5},
+          {"step": 3_000 * steps_per_iteration, "weight": 0.5},
         ],
       },
     ),
@@ -708,7 +709,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "base_drift",
         "stages": [
           {"step": 0, "weight": -4.0},
-          {"step": 500 * steps_per_iteration, "weight": -2.0},
+          {"step": 3_000 * steps_per_iteration, "weight": -2.0},
         ],
       },
     ),
@@ -718,8 +719,8 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "action_rate_l2",
         "stages": [
           {"step": 0, "weight": -0.05},
-          {"step": 500 * steps_per_iteration, "weight": -0.02},
-          {"step": 3_000 * steps_per_iteration, "weight": -0.01},
+          {"step": 3_000 * steps_per_iteration, "weight": -0.02},
+          {"step": 9_000 * steps_per_iteration, "weight": -0.01},
         ],
       },
     ),
@@ -729,7 +730,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "left_arm_pose",
         "stages": [
           {"step": 0, "weight": -0.5},
-          {"step": 500 * steps_per_iteration, "weight": -0.1},
+          {"step": 3_000 * steps_per_iteration, "weight": -0.1},
         ],
       },
     ),
@@ -739,7 +740,8 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "right_arm_pose",
         "stages": [
           {"step": 0, "weight": -0.5},
-          {"step": 500 * steps_per_iteration, "weight": 0.0},
+          {"step": 3_000 * steps_per_iteration, "weight": -0.2},
+          {"step": 6_000 * steps_per_iteration, "weight": 0.0},
         ],
       },
     ),
@@ -750,7 +752,7 @@ def talos_tabletop_grasp_env_cfg(
         "stages": [
           {"step": 0, "params": {"minimum_height": -10.0}},
           {
-            "step": 500 * steps_per_iteration,
+            "step": 6_000 * steps_per_iteration,
             "params": {"minimum_height": TABLE_TOP_HEIGHT_M - 0.12},
           },
         ],
@@ -762,7 +764,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "approach_object",
         "stages": [
           {"step": 0, "weight": 0.0},
-          {"step": 500 * steps_per_iteration, "weight": 2.0},
+          {"step": 3_000 * steps_per_iteration, "weight": 2.0},
         ],
       },
     ),
@@ -772,7 +774,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "multi_link_contact",
         "stages": [
           {"step": 0, "weight": 0.0},
-          {"step": 1_500 * steps_per_iteration, "weight": 3.0},
+          {"step": 6_000 * steps_per_iteration, "weight": 3.0},
         ],
       },
     ),
@@ -782,7 +784,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "lift_progress",
         "stages": [
           {"step": 0, "weight": 0.0},
-          {"step": 3_000 * steps_per_iteration, "weight": 8.0},
+          {"step": 9_000 * steps_per_iteration, "weight": 8.0},
         ],
       },
     ),
@@ -792,7 +794,7 @@ def talos_tabletop_grasp_env_cfg(
         "reward_name": "grasp_lift_success",
         "stages": [
           {"step": 0, "weight": 0.0},
-          {"step": 3_000 * steps_per_iteration, "weight": 5.0},
+          {"step": 9_000 * steps_per_iteration, "weight": 5.0},
         ],
       },
     ),
