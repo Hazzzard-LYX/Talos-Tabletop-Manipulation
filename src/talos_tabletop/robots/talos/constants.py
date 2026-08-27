@@ -818,9 +818,7 @@ INIT_STATE = EntityCfg.InitialStateCfg(
 )
 
 GRASPING_INIT_STATE = EntityCfg.InitialStateCfg(
-  # Start close to nominal foot contact instead of dropping the full-body
-  # controller from the generic 1.00 m base height at every reset.
-  pos=(0.0, 0.0, 0.99),
+  pos=INIT_STATE.pos,
   rot=INIT_STATE.rot,
   lin_vel=INIT_STATE.lin_vel,
   ang_vel=INIT_STATE.ang_vel,

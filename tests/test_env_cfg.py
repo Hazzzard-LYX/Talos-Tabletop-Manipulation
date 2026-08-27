@@ -52,7 +52,8 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert {"approach_object", "multi_link_contact", "lift_progress"} <= set(
     cfg.rewards
   )
-  assert cfg.scene.entities["robot"].init_state.pos == (0.0, 0.0, 0.99)
+  assert cfg.scene.entities["robot"].init_state.pos == (0.0, 0.0, 1.0)
+  assert cfg.events["reset_robot_joints"].params["position_range"] == (0.0, 0.0)
   assert cfg.rewards["approach_object"].weight == 0.0
   assert cfg.rewards["multi_link_contact"].weight == 0.0
   assert cfg.rewards["lift_progress"].weight == 0.0

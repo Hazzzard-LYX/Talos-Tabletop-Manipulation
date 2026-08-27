@@ -498,7 +498,9 @@ def talos_tabletop_grasp_env_cfg(
 
   cfg.events["reset_robot_joints"].params.update(
     {
-      "position_range": (-0.02, 0.02),
+      # Match the validated WBC grasp setup exactly during the initial
+      # balance curriculum instead of perturbing the unsupported landing.
+      "position_range": (0.0, 0.0),
       "velocity_range": (0.0, 0.0),
     }
   )
