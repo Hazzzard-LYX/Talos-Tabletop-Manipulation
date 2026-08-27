@@ -11,7 +11,7 @@
 set -euo pipefail
 
 WORKSPACE="${HOME}/IAS_Workspace"
-PROJECT_ROOT="${WORKSPACE}/projects/Talos-Tabletop-Manipulation"
+PROJECT_ROOT="${PROJECT_ROOT:-${WORKSPACE}/projects/Talos-Tabletop-Manipulation}"
 PYTHON="${WORKSPACE}/envs/mjlab-cu128/bin/python"
 TASK="${TASK:-Mjlab-Tabletop-Grasp-Cube-Talos-v0}"
 NUM_ENVS="${NUM_ENVS:-256}"
