@@ -5,13 +5,19 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply_inverse, quat_conjugate, quat_mul
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 _DEFAULT_OBJECT_CFG = SceneEntityCfg("object")
+
+# Collision observations use a fixed-size oriented-box interface so future
+# perception modules can populate predicted obstacles without changing the
+# actor input size.  Each slot is:
+#   center_b xyz, half_extents xyz, orientation_b wxyz, occupied flag.
+OBSTACLE_BOX_FEATURE_DIM = 11
 
 
 def commands_gen(
@@ -48,3 +54,64 @@ def object_vector_from_site(
   obj: Entity = env.scene[object_cfg.name]
   site_id = robot.site_names.index(site_name)
   return obj.data.root_link_pos_w - robot.data.site_pos_w[:, site_id]
+
+
+def point_in_robot_frame(
+  env: ManagerBasedRlEnv,
+  point: tuple[float, float, float],
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Return an environment-local target point in the robot root frame."""
+  robot: Entity = env.scene[robot_cfg.name]
+  point_w = torch.tensor(point, device=env.device, dtype=torch.float).repeat(
+    env.num_envs, 1
+  )
+  point_w += env.scene.env_origins
+  return quat_apply_inverse(
+    robot.data.root_link_quat_w,
+    point_w - robot.data.root_link_pos_w,
+  )
+
+
+def obstacle_boxes_in_robot_frame(
+  env: ManagerBasedRlEnv,
+  obstacle_names: tuple[str, ...],
+  half_extents: tuple[tuple[float, float, float], ...],
+  max_obstacles: int,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Encode collision obstacles as fixed-capacity oriented boxes.
+
+  The returned flattened tensor contains ``max_obstacles`` slots of 11 values:
+  ``center_b[3], half_extents[3], orientation_b[4], occupied[1]``.  Unused
+  slots are zero.  A future collision predictor can fill those reserved slots
+  with arbitrary world obstacles while preserving the observation contract.
+  """
+  if len(obstacle_names) != len(half_extents):
+    raise ValueError("obstacle_names and half_extents must have equal length.")
+  if len(obstacle_names) > max_obstacles:
+    raise ValueError("Configured obstacles exceed max_obstacles capacity.")
+
+  robot: Entity = env.scene[robot_cfg.name]
+  descriptors = torch.zeros(
+    (env.num_envs, max_obstacles, OBSTACLE_BOX_FEATURE_DIM),
+    device=env.device,
+    dtype=torch.float,
+  )
+  robot_quat_inv = quat_conjugate(robot.data.root_link_quat_w)
+
+  for slot, (name, extent) in enumerate(zip(obstacle_names, half_extents, strict=True)):
+    obstacle: Entity = env.scene[name]
+    offset_w = obstacle.data.root_link_pos_w - robot.data.root_link_pos_w
+    descriptors[:, slot, 0:3] = quat_apply_inverse(
+      robot.data.root_link_quat_w, offset_w
+    )
+    descriptors[:, slot, 3:6] = torch.tensor(
+      extent, device=env.device, dtype=torch.float
+    )
+    descriptors[:, slot, 6:10] = quat_mul(
+      robot_quat_inv, obstacle.data.root_link_quat_w
+    )
+    descriptors[:, slot, 10] = 1.0
+
+  return descriptors.flatten(start_dim=1)

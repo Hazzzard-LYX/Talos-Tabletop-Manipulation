@@ -1,7 +1,10 @@
 import re
 
+import pytest
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from talos_tabletop.tasks.tabletop.env_cfg import (
+  MAX_COLLISION_OBSTACLES,
+  ROBOT_SPAWN_POSITION_M,
   talos_tabletop_grasp_env_cfg,
   talos_tabletop_reaching_env_cfg,
 )
@@ -41,6 +44,9 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert cfg.commands == {}
   assert "privileged_object_center_b" in cfg.observations["actor"].terms
   assert "privileged_object_center_b" in cfg.observations["critic"].terms
+  assert "collision_obstacle_boxes_b" in cfg.observations["actor"].terms
+  assert "table_approach_target_b" in cfg.observations["actor"].terms
+  assert "placement_target_b" in cfg.observations["actor"].terms
   assert "base_lin_vel" not in cfg.observations["actor"].terms
   assert "base_lin_vel" in cfg.observations["critic"].terms
   assert {sensor.name for sensor in cfg.scene.sensors} == {
@@ -49,26 +55,41 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
     "body_ground_contact",
     "body_table_contact",
   }
-  assert {"approach_object", "multi_link_contact", "lift_progress"} <= set(
-    cfg.rewards
+  assert {
+    "standing_success",
+    "navigate_to_table",
+    "reach_table_success",
+    "approach_object",
+    "multi_link_contact",
+    "lift_progress",
+    "object_target",
+    "place_success",
+  } <= set(cfg.rewards)
+  assert cfg.scene.entities["robot"].init_state.pos == pytest.approx(
+    ROBOT_SPAWN_POSITION_M
   )
-  assert cfg.scene.entities["robot"].init_state.pos == (0.0, 0.0, 1.0)
+  assert cfg.scene.env_spacing == 0.0
+  assert "reset_robot_root" in cfg.events
   assert cfg.events["reset_robot_joints"].params["position_range"] == (0.0, 0.0)
   assert cfg.rewards["approach_object"].weight == 0.0
   assert cfg.rewards["multi_link_contact"].weight == 0.0
   assert cfg.rewards["lift_progress"].weight == 0.0
   assert cfg.rewards["right_arm_pose"].weight == -0.5
   assert cfg.terminations["object_lost"].params["minimum_height"] == -10.0
-  assert {
-    "upright",
-    "both_feet_contact",
-    "approach_object",
-    "multi_link_contact",
-    "lift_progress",
+  assert set(cfg.curriculum) == {"task_stage"}
+  curriculum_params = cfg.curriculum["task_stage"].params
+  assert curriculum_params["promotion_reward_names"] == (
+    "standing_success",
+    "reach_table_success",
     "grasp_lift_success",
-    "object_lost",
-    "right_arm_pose",
-  } <= set(cfg.curriculum)
+  )
+  assert curriculum_params["promotion_success_rates"] == (0.80, 0.70, 0.60)
+  assert len(curriculum_params["stage_reward_weights"]) == 4
+  assert all("step" not in key for key in curriculum_params)
+
+  obstacle_params = cfg.observations["actor"].terms["collision_obstacle_boxes_b"].params
+  assert obstacle_params["obstacle_names"] == ("table",)
+  assert obstacle_params["max_obstacles"] == MAX_COLLISION_OBSTACLES
 
   body_ground = next(
     sensor for sensor in cfg.scene.sensors if sensor.name == "body_ground_contact"

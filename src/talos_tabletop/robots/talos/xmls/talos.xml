@@ -70,7 +70,7 @@
   </asset>
 
   <worldbody>
-    <body name="base_link" childclass="talos" pos="0 0 1.1">
+    <body name="base_link" childclass="talos" pos="0 0 1.0">
       <inertial pos="-0.0570942 0.00153054 -0.0762521" quat="0.528705 0.532893 -0.46798 0.466359" mass="15.3628" diaginertia="0.23241 0.200537 0.0841093"/>
       <joint name="reference" type="free" damping="0" frictionloss="0"/>
       <geom class="visual" material="white" mesh="base_link"/>
