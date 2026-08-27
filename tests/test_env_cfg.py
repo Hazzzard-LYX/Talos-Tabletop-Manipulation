@@ -86,6 +86,12 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert curriculum_params["promotion_success_rates"] == (0.80, 0.70, 0.60)
   assert len(curriculum_params["stage_reward_weights"]) == 4
   assert all("step" not in key for key in curriculum_params)
+  navigation_weights = curriculum_params["stage_reward_weights"][1]
+  assert navigation_weights["navigate_to_table"] == 6.0
+  assert navigation_weights["navigation_progress"] == 10.0
+  assert navigation_weights["standing_success"] == 0.2
+  assert navigation_weights["base_motion"] == 0.0
+  assert cfg.rewards["navigate_to_table"].params["std"] == 3.0
 
   obstacle_params = cfg.observations["actor"].terms["collision_obstacle_boxes_b"].params
   assert obstacle_params["obstacle_names"] == ("table",)

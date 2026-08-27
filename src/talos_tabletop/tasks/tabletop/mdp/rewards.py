@@ -248,7 +248,12 @@ def base_target_distance_tanh(
 
 
 class base_target_progress:
-  """Reward reduction in planar distance to the navigation target."""
+  """Reward radial velocity toward the planar navigation target.
+
+  Reward terms are multiplied by ``env.step_dt`` by the manager.  Dividing the
+  per-step distance reduction here makes the integrated episode reward equal
+  to weighted path progress instead of shrinking it by a second factor of dt.
+  """
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     del cfg
@@ -271,7 +276,11 @@ class base_target_progress:
       asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
     )
     initialized = torch.isfinite(self._previous_distance)
-    progress = torch.where(initialized, self._previous_distance - distance, 0.0)
+    progress = torch.where(
+      initialized,
+      (self._previous_distance - distance) / env.step_dt,
+      0.0,
+    )
     self._previous_distance = distance.detach().clone()
     return progress
 
