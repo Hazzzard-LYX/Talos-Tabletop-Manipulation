@@ -678,7 +678,11 @@ def talos_tabletop_grasp_env_cfg(
     "navigation_progress": RewardTermCfg(
       func=mdp.base_target_progress,
       weight=0.0,
-      params={"target_position": TABLE_APPROACH_BASE_XY_M},
+      params={
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "maximum_speed": 0.5,
+        "maximum_projected_gravity_xy": 0.70,
+      },
     ),
     "reach_table_success": RewardTermCfg(
       func=mdp.sustained_navigation_success,
@@ -757,6 +761,10 @@ def talos_tabletop_grasp_env_cfg(
         "maximum_release_contacts": 0,
       },
     ),
+    "termination_penalty": RewardTermCfg(
+      func=mdp.is_terminated,
+      weight=-200.0,
+    ),
     "dof_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
     "action_magnitude_l2": RewardTermCfg(
       func=mdp.action_magnitude_l2,
@@ -799,6 +807,7 @@ def talos_tabletop_grasp_env_cfg(
   # explicitly sets all mutable weights so a promoted environment cannot retain
   # stale shaping from the previous stage.
   safety_weights = {
+    "termination_penalty": -200.0,
     "dof_pos_limits": -1.0,
     "action_magnitude_l2": -0.02,
     "action_rate_l2": -0.02,
@@ -837,7 +846,7 @@ def talos_tabletop_grasp_env_cfg(
       "base_motion": 0.0,
       "base_drift": 0.0,
       "navigate_to_table": 6.0,
-      "navigation_progress": 10.0,
+      "navigation_progress": 6.0,
       "reach_table_success": 10.0,
       "lower_body_pose": -0.05,
       "left_arm_pose": -0.1,

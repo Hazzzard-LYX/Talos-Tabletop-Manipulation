@@ -265,6 +265,8 @@ class base_target_progress:
     self,
     env: ManagerBasedRlEnv,
     target_position: tuple[float, float],
+    maximum_speed: float,
+    maximum_projected_gravity_xy: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
@@ -276,13 +278,16 @@ class base_target_progress:
       asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
     )
     initialized = torch.isfinite(self._previous_distance)
-    progress = torch.where(
+    radial_velocity = torch.where(
       initialized,
       (self._previous_distance - distance) / env.step_dt,
       0.0,
     )
     self._previous_distance = distance.detach().clone()
-    return progress
+    radial_velocity = radial_velocity.clamp(-maximum_speed, maximum_speed)
+    tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
+    upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
+    return radial_velocity * upright_scale
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     self._previous_distance[env_ids] = float("nan")
