@@ -247,19 +247,32 @@ def base_target_distance_tanh(
   return 1.0 - torch.tanh(distance / std)
 
 
-class base_target_progress:
-  """Reward radial velocity toward the planar navigation target.
+def _base_target_radial_velocity(
+  asset: Entity,
+  target_xy: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Return planar speed and signed world-frame velocity toward a target."""
+  target_offset = target_xy - asset.data.root_link_pos_w[:, :2]
+  target_direction = target_offset / torch.linalg.vector_norm(
+    target_offset, dim=1, keepdim=True
+  ).clamp_min(1.0e-6)
+  planar_velocity = asset.data.root_link_vel_w[:, :2]
+  planar_speed = torch.linalg.vector_norm(planar_velocity, dim=1)
+  radial_velocity = torch.sum(planar_velocity * target_direction, dim=1)
+  return planar_speed, radial_velocity
 
-  Reward terms are multiplied by ``env.step_dt`` by the manager.  Dividing the
-  per-step distance reduction here makes the integrated episode reward equal
-  to weighted path progress instead of shrinking it by a second factor of dt.
+
+class base_target_progress:
+  """Reward measured base velocity toward the planar navigation target.
+
+  The reward manager integrates this velocity with ``env.step_dt``, so the
+  episode return is proportional to net target-directed displacement.  Reading
+  MuJoCo's root velocity directly also makes zero physical speed produce exactly
+  zero progress reward.
   """
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
-    del cfg
-    self._previous_distance = torch.full(
-      (env.num_envs,), float("nan"), device=env.device
-    )
+    del cfg, env
 
   def __call__(
     self,
@@ -274,23 +287,49 @@ class base_target_progress:
       target_position, device=env.device, dtype=torch.float
     ).repeat(env.num_envs, 1)
     target_xy += env.scene.env_origins[:, :2]
-    distance = torch.linalg.vector_norm(
-      asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
-    )
-    initialized = torch.isfinite(self._previous_distance)
-    radial_velocity = torch.where(
-      initialized,
-      (self._previous_distance - distance) / env.step_dt,
-      0.0,
-    )
-    self._previous_distance = distance.detach().clone()
+    planar_speed, radial_velocity = _base_target_radial_velocity(asset, target_xy)
     radial_velocity = radial_velocity.clamp(-maximum_speed, maximum_speed)
     tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
     upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
+    env.extras["log"]["Metrics/base_lin_vel_x_mps"] = (
+      asset.data.root_link_vel_w[:, 0].mean()
+    )
+    env.extras["log"]["Metrics/base_lin_vel_y_mps"] = (
+      asset.data.root_link_vel_w[:, 1].mean()
+    )
+    env.extras["log"]["Metrics/base_planar_speed_mps"] = planar_speed.mean()
+    env.extras["log"]["Metrics/base_target_radial_speed_mps"] = (
+      radial_velocity.mean()
+    )
     return radial_velocity * upright_scale
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
-    self._previous_distance[env_ids] = float("nan")
+    del env_ids
+
+
+def base_target_speed_above_threshold(
+  env: ManagerBasedRlEnv,
+  target_position: tuple[float, float],
+  minimum_speed: float,
+  target_speed: float,
+  maximum_projected_gravity_xy: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward deliberate target-directed motion, with no reward below a deadband."""
+  if not 0.0 <= minimum_speed < target_speed:
+    raise ValueError("Expected 0 <= minimum_speed < target_speed.")
+  asset: Entity = env.scene[asset_cfg.name]
+  target_xy = torch.tensor(
+    target_position, device=env.device, dtype=torch.float
+  ).repeat(env.num_envs, 1)
+  target_xy += env.scene.env_origins[:, :2]
+  _, radial_velocity = _base_target_radial_velocity(asset, target_xy)
+  speed_scale = (
+    (radial_velocity - minimum_speed) / (target_speed - minimum_speed)
+  ).clamp(0.0, 1.0)
+  tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
+  upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
+  return speed_scale * upright_scale
 
 
 class sustained_navigation_success:
