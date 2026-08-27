@@ -56,6 +56,8 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert cfg.rewards["approach_object"].weight == 0.0
   assert cfg.rewards["multi_link_contact"].weight == 0.0
   assert cfg.rewards["lift_progress"].weight == 0.0
+  assert cfg.rewards["right_arm_pose"].weight == -0.5
+  assert cfg.terminations["object_lost"].params["minimum_height"] == -10.0
   assert {
     "upright",
     "both_feet_contact",
@@ -63,6 +65,8 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
     "multi_link_contact",
     "lift_progress",
     "grasp_lift_success",
+    "object_lost",
+    "right_arm_pose",
   } <= set(cfg.curriculum)
 
   body_ground = next(

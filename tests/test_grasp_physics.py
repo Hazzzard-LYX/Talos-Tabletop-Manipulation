@@ -13,7 +13,7 @@ def test_normal_foot_landing_does_not_reset_or_move_object() -> None:
     initial_object_xy = obj.data.root_link_pos_w[0, :2].clone()
     zero_action = torch.zeros((1, env.action_manager.total_action_dim))
 
-    for _ in range(8):
+    for _ in range(30):
       env.step(zero_action)
       assert not bool(env.reset_buf[0])
 

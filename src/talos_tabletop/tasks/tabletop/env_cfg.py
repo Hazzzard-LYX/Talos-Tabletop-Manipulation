@@ -578,6 +578,7 @@ def talos_tabletop_grasp_env_cfg(
   initial_center_height = object_initial_position(object_shape)[2]
   lower_body = SceneEntityCfg("robot", joint_names=(r"leg_.*_joint",))
   left_arm = SceneEntityCfg("robot", joint_names=(r"arm_left_.*_joint",))
+  right_arm = SceneEntityCfg("robot", joint_names=(r"arm_right_.*_joint",))
   cfg.rewards = {
     "upright": RewardTermCfg(
       func=mdp.upright,
@@ -604,8 +605,13 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "left_arm_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
-      weight=-0.1,
+      weight=-0.5,
       params={"asset_cfg": left_arm},
+    ),
+    "right_arm_pose": RewardTermCfg(
+      func=mdp.joint_deviation_l2,
+      weight=-0.5,
+      params={"asset_cfg": right_arm},
     ),
     "approach_object": RewardTermCfg(
       func=mdp.site_object_distance_tanh,
@@ -669,7 +675,7 @@ def talos_tabletop_grasp_env_cfg(
     ),
     "object_lost": TerminationTermCfg(
       func=mdp.object_height_below,
-      params={"minimum_height": TABLE_TOP_HEIGHT_M - 0.12},
+      params={"minimum_height": -10.0},
     ),
   }
   # One PPO iteration collects 24 environment steps.  First learn a quiet,
@@ -714,6 +720,39 @@ def talos_tabletop_grasp_env_cfg(
           {"step": 0, "weight": -0.05},
           {"step": 500 * steps_per_iteration, "weight": -0.02},
           {"step": 3_000 * steps_per_iteration, "weight": -0.01},
+        ],
+      },
+    ),
+    "left_arm_pose": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "left_arm_pose",
+        "stages": [
+          {"step": 0, "weight": -0.5},
+          {"step": 500 * steps_per_iteration, "weight": -0.1},
+        ],
+      },
+    ),
+    "right_arm_pose": CurriculumTermCfg(
+      func=mdp.reward_curriculum,
+      params={
+        "reward_name": "right_arm_pose",
+        "stages": [
+          {"step": 0, "weight": -0.5},
+          {"step": 500 * steps_per_iteration, "weight": 0.0},
+        ],
+      },
+    ),
+    "object_lost": CurriculumTermCfg(
+      func=mdp.termination_curriculum,
+      params={
+        "termination_name": "object_lost",
+        "stages": [
+          {"step": 0, "params": {"minimum_height": -10.0}},
+          {
+            "step": 500 * steps_per_iteration,
+            "params": {"minimum_height": TABLE_TOP_HEIGHT_M - 0.12},
+          },
         ],
       },
     ),
