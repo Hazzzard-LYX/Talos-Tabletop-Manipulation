@@ -77,3 +77,8 @@ def test_navigation_speed_has_zero_reward_below_deadband() -> None:
   ).item() == pytest.approx(0.5)
   robot.data.root_link_vel_w[0, 0] = 0.25
   assert mdp.base_target_speed_above_threshold(env, **params).item() == 1.0
+
+  robot.data.root_link_pos_w[0, 2] = 0.8
+  assert mdp.base_target_speed_above_threshold(
+    env, minimum_height=0.85, **params
+  ).item() == 0.0

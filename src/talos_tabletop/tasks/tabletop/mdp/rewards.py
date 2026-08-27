@@ -159,6 +159,11 @@ def base_position_deviation_l2(
 
 def both_feet_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   """Reward retaining ground contact on both feet while manipulating."""
+  return _per_foot_contact(env, sensor_name).all(dim=1).float()
+
+
+def _per_foot_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+  """Return one contact-presence column per configured foot."""
   sensor = env.scene[sensor_name]
   if not isinstance(sensor, ContactSensor) or sensor.data.found is None:
     raise TypeError(f"'{sensor_name}' must provide ContactSensor found data.")
@@ -167,7 +172,7 @@ def both_feet_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   per_foot = found.reshape(env.num_envs, len(sensor.primary_names), num_slots).any(
     dim=2
   )
-  return per_foot.all(dim=1).float()
+  return per_foot
 
 
 def _stable_standing_mask(
@@ -280,6 +285,8 @@ class base_target_progress:
     target_position: tuple[float, float],
     maximum_speed: float,
     maximum_projected_gravity_xy: float,
+    sensor_name: str | None = None,
+    minimum_height: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
@@ -291,6 +298,10 @@ class base_target_progress:
     radial_velocity = radial_velocity.clamp(-maximum_speed, maximum_speed)
     tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
     upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
+    supported = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    if sensor_name is not None:
+      supported = _per_foot_contact(env, sensor_name).any(dim=1)
+    valid_posture = supported & (asset.data.root_link_pos_w[:, 2] >= minimum_height)
     env.extras["log"]["Metrics/base_lin_vel_x_mps"] = (
       asset.data.root_link_vel_w[:, 0].mean()
     )
@@ -301,7 +312,10 @@ class base_target_progress:
     env.extras["log"]["Metrics/base_target_radial_speed_mps"] = (
       radial_velocity.mean()
     )
-    return radial_velocity * upright_scale
+    env.extras["log"]["Metrics/navigation_reward_gate"] = (
+      valid_posture.float().mean()
+    )
+    return radial_velocity * upright_scale * valid_posture.float()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     del env_ids
@@ -313,6 +327,8 @@ def base_target_speed_above_threshold(
   minimum_speed: float,
   target_speed: float,
   maximum_projected_gravity_xy: float,
+  sensor_name: str | None = None,
+  minimum_height: float = 0.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """Reward deliberate target-directed motion, with no reward below a deadband."""
@@ -329,7 +345,11 @@ def base_target_speed_above_threshold(
   ).clamp(0.0, 1.0)
   tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
   upright_scale = (1.0 - tilt / maximum_projected_gravity_xy).clamp(0.0, 1.0)
-  return speed_scale * upright_scale
+  supported = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+  if sensor_name is not None:
+    supported = _per_foot_contact(env, sensor_name).any(dim=1)
+  valid_posture = supported & (asset.data.root_link_pos_w[:, 2] >= minimum_height)
+  return speed_scale * upright_scale * valid_posture.float()
 
 
 class sustained_navigation_success:

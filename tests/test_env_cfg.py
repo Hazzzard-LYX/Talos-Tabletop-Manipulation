@@ -90,17 +90,19 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert all("step" not in key for key in curriculum_params)
   navigation_weights = curriculum_params["stage_reward_weights"][1]
   assert navigation_weights["navigate_to_table"] == 0.0
-  assert navigation_weights["navigation_progress"] == 15.0
-  assert navigation_weights["navigation_speed"] == 4.0
-  assert navigation_weights["standing_success"] == 0.05
+  assert navigation_weights["navigation_progress"] == 8.0
+  assert navigation_weights["navigation_speed"] == 1.0
+  assert navigation_weights["standing_success"] == 0.1
   assert navigation_weights["base_motion"] == 0.0
-  assert navigation_weights["termination_penalty"] == -500.0
+  assert navigation_weights["termination_penalty"] == -1000.0
   assert cfg.rewards["navigate_to_table"].params["std"] == 3.0
   assert cfg.rewards["navigation_speed"].params == {
     "target_position": pytest.approx((0.0, 0.0)),
     "minimum_speed": 0.05,
-    "target_speed": 0.25,
-    "maximum_projected_gravity_xy": 0.70,
+    "target_speed": 0.20,
+    "maximum_projected_gravity_xy": 0.25,
+    "sensor_name": "feet_ground_contact",
+    "minimum_height": 0.85,
   }
 
   obstacle_params = cfg.observations["actor"].terms["collision_obstacle_boxes_b"].params
