@@ -61,3 +61,14 @@ def talos_tabletop_position_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   cfg.save_interval = 250
   cfg.max_iterations = 20_000
   return cfg
+
+
+def talos_tabletop_stationary_grasp_ppo_runner_cfg(
+  object_shape: str,
+) -> RslRlOnPolicyRunnerCfg:
+  """Return the stationary stand-then-lift policy runner configuration."""
+  cfg = talos_tabletop_ppo_runner_cfg()
+  cfg.experiment_name = f"talos_tabletop_stationary_grasp_{object_shape}"
+  cfg.save_interval = 250
+  cfg.max_iterations = 20_000
+  return cfg

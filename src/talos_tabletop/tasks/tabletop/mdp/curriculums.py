@@ -32,6 +32,9 @@ class performance_stage_curriculum:
     self._stage_termination_params: tuple[dict[str, dict[str, Any]], ...] = params.get(
       "stage_termination_params", tuple({} for _ in self._stage_reward_weights)
     )
+    self._stage_event_params: tuple[dict[str, dict[str, Any]], ...] = params.get(
+      "stage_event_params", tuple({} for _ in self._stage_reward_weights)
+    )
     self.current_stage = int(params.get("initial_stage", 0))
     self._window_episodes = 0
     self._window_successes = 0
@@ -53,6 +56,8 @@ class performance_stage_curriculum:
       )
     if len(self._stage_termination_params) != len(self._stage_reward_weights):
       raise ValueError("stage_termination_params must match the number of stages.")
+    if len(self._stage_event_params) != len(self._stage_reward_weights):
+      raise ValueError("stage_event_params must match the number of stages.")
 
     for stage_weights in self._stage_reward_weights:
       for reward_name in stage_weights:
@@ -70,6 +75,9 @@ class performance_stage_curriculum:
     ].items():
       term_cfg = self._env.termination_manager.get_term_cfg(termination_name)
       term_cfg.params.update(params)
+    for event_name, params in self._stage_event_params[self.current_stage].items():
+      event_cfg = self._env.event_manager.get_term_cfg(event_name)
+      event_cfg.params.update(params)
 
   def __call__(
     self,
@@ -80,6 +88,7 @@ class performance_stage_curriculum:
     promotion_success_rates: tuple[float, ...],
     evaluation_episodes: tuple[int, ...],
     stage_termination_params: tuple[dict[str, dict[str, Any]], ...],
+    stage_event_params: tuple[dict[str, dict[str, Any]], ...] | None = None,
     initial_stage: int = 0,
   ) -> dict[str, torch.Tensor]:
     del (
@@ -88,6 +97,7 @@ class performance_stage_curriculum:
       promotion_success_rates,
       evaluation_episodes,
       stage_termination_params,
+      stage_event_params,
       initial_stage,
     )
 
@@ -107,6 +117,12 @@ class performance_stage_curriculum:
         if self._last_success_rate >= required_rate:
           self.current_stage += 1
           self._apply_stage()
+          # Stage changes can alter the physical scene (for example, restoring
+          # the table and object after the stand-only stage).  Reset every
+          # environment at the new stage instead of leaving a mixed-stage
+          # batch until each environment happens to terminate independently.
+          if hasattr(env, "reset_buf"):
+            env.reset_buf[:] = True
         self._window_episodes = 0
         self._window_successes = 0
 

@@ -20,6 +20,34 @@ _DEFAULT_OBJECT_CFG = SceneEntityCfg("object")
 OBSTACLE_BOX_FEATURE_DIM = 11
 
 
+def _curriculum_stage_mask(
+  env: ManagerBasedRlEnv,
+  minimum_stage: int | None,
+  curriculum_term_name: str,
+) -> torch.Tensor:
+  """Return a broadcastable mask for observations introduced by a later stage."""
+  if minimum_stage is None:
+    return torch.ones((env.num_envs, 1), device=env.device, dtype=torch.float)
+  if hasattr(env, "curriculum_manager"):
+    term_cfg = env.curriculum_manager.get_term_cfg(curriculum_term_name)
+    current_stage = getattr(term_cfg.func, "current_stage", 0)
+  else:
+    current_stage = int(
+      env.cfg.curriculum[curriculum_term_name].params.get("initial_stage", 0)
+    )
+  active = float(current_stage >= minimum_stage)
+  return torch.full(
+    (env.num_envs, 1), active, device=env.device, dtype=torch.float
+  )
+
+
+def zero_vector(env: ManagerBasedRlEnv, size: int) -> torch.Tensor:
+  """Reserve a fixed observation interface for a policy that ignores the term."""
+  if size <= 0:
+    raise ValueError("zero-vector size must be positive")
+  return torch.zeros((env.num_envs, size), device=env.device, dtype=torch.float)
+
+
 def locomotion_phase(
   env: ManagerBasedRlEnv,
   period: float,
@@ -57,6 +85,8 @@ def commands_gen(
 
 def object_position_in_robot_frame(
   env: ManagerBasedRlEnv,
+  minimum_curriculum_stage: int | None = None,
+  curriculum_term_name: str = "task_stage",
   robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
@@ -64,7 +94,10 @@ def object_position_in_robot_frame(
   robot: Entity = env.scene[robot_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
   offset_w = obj.data.root_link_pos_w - robot.data.root_link_pos_w
-  return quat_apply_inverse(robot.data.root_link_quat_w, offset_w)
+  position_b = quat_apply_inverse(robot.data.root_link_quat_w, offset_w)
+  return position_b * _curriculum_stage_mask(
+    env, minimum_curriculum_stage, curriculum_term_name
+  )
 
 
 def object_vector_from_site(
@@ -102,6 +135,8 @@ def obstacle_boxes_in_robot_frame(
   obstacle_names: tuple[str, ...],
   half_extents: tuple[tuple[float, float, float], ...],
   max_obstacles: int,
+  minimum_curriculum_stage: int | None = None,
+  curriculum_term_name: str = "task_stage",
   robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """Encode collision obstacles as fixed-capacity oriented boxes.
@@ -138,4 +173,7 @@ def obstacle_boxes_in_robot_frame(
     )
     descriptors[:, slot, 10] = 1.0
 
-  return descriptors.flatten(start_dim=1)
+  flattened = descriptors.flatten(start_dim=1)
+  return flattened * _curriculum_stage_mask(
+    env, minimum_curriculum_stage, curriculum_term_name
+  )

@@ -7,9 +7,11 @@ from talos_tabletop.tasks.tabletop.env_cfg import (
   LOCOMOTION_PERIOD_S,
   MAX_COLLISION_OBSTACLES,
   ROBOT_SPAWN_POSITION_M,
+  STATIONARY_GRASP_ROBOT_POSITION_M,
   talos_tabletop_grasp_env_cfg,
   talos_tabletop_position_tracking_env_cfg,
   talos_tabletop_reaching_env_cfg,
+  talos_tabletop_stationary_grasp_env_cfg,
 )
 
 
@@ -164,3 +166,39 @@ def test_position_tracking_task_stops_before_manipulation_mode() -> None:
   assert cfg.observations["actor"].terms["locomotion_phase"].params[
     "control_mode"
   ] == "position_tracking"
+
+
+def test_stationary_grasp_task_has_only_stand_and_lift_stages() -> None:
+  cfg = talos_tabletop_stationary_grasp_env_cfg()
+  params = cfg.curriculum["task_stage"].params
+
+  assert cfg.scene.entities["robot"].init_state.pos == pytest.approx(
+    STATIONARY_GRASP_ROBOT_POSITION_M
+  )
+  assert params["promotion_reward_names"] == ("standing_success",)
+  assert params["promotion_success_rates"] == (0.80,)
+  assert len(params["stage_reward_weights"]) == 2
+  standing_weights, grasp_weights = params["stage_reward_weights"]
+  assert standing_weights["standing_success"] == 10.0
+  assert standing_weights["approach_object"] == 0.0
+  assert grasp_weights["approach_object"] == 4.0
+  assert grasp_weights["multi_link_contact"] == 5.0
+  assert grasp_weights["lift_progress"] == 10.0
+  assert grasp_weights["grasp_lift_success"] == 12.0
+  for weights in params["stage_reward_weights"]:
+    assert weights["navigation_progress"] == 0.0
+    assert weights["reach_table_success"] == 0.0
+    assert weights["object_target"] == 0.0
+    assert weights["place_success"] == 0.0
+  assert params["stage_event_params"][0]["reset_table_root"]["pose_range"] == {
+    "x": (10.0, 10.0)
+  }
+  assert params["stage_event_params"][1]["reset_table_root"]["pose_range"] == {}
+  assert cfg.rewards["standing_success"].params["maximum_linear_speed"] == 0.05
+  assert cfg.rewards["standing_success"].params["maximum_angular_speed"] == 0.10
+  assert cfg.observations["actor"].terms["locomotion_phase"].params[
+    "control_mode"
+  ] == "manipulation"
+  assert cfg.observations["actor"].terms[
+    "privileged_object_center_b"
+  ].params["minimum_curriculum_stage"] == 1

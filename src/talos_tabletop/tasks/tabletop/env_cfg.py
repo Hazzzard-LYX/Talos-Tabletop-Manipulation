@@ -45,6 +45,8 @@ ROBOT_SPAWN_POSITION_M = (
   0.0,
   1.0,
 )
+STATIONARY_GRASP_ROBOT_POSITION_M = (0.0, 0.0, 1.0)
+HIDDEN_SCENE_X_OFFSET_M = 10.0
 TABLE_APPROACH_BASE_XY_M = (0.0, 0.0)
 MAX_COLLISION_OBSTACLES = 8
 LOCOMOTION_PERIOD_S = 0.8
@@ -1165,6 +1167,142 @@ def talos_tabletop_position_tracking_env_cfg(
         "stage_termination_params": (
           {"object_lost": {"minimum_height": -10.0}},
           {"object_lost": {"minimum_height": -10.0}},
+        ),
+      },
+    )
+  }
+  return cfg
+
+
+def talos_tabletop_stationary_grasp_env_cfg(
+  object_shape: ObjectShape = "cube",
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Train a stationary manipulation policy without navigation or placement.
+
+  Stage 0 removes the table and object from the physical scene and masks their
+  observations while the robot learns to stand still.  Stage 1 restores the
+  tabletop scene and trains right-hand approach, multi-link contact, and lift.
+  It is the terminal stage: object transport and placement stay disabled.
+  """
+  cfg = talos_tabletop_grasp_env_cfg(
+    object_shape=object_shape,
+    play=play,
+    control_mode="manipulation",
+  )
+  cfg.scene.entities["robot"].init_state.pos = STATIONARY_GRASP_ROBOT_POSITION_M
+
+  for group in cfg.observations.values():
+    obstacle_params = dict(group.terms["collision_obstacle_boxes_b"].params)
+    obstacle_params["minimum_curriculum_stage"] = 1
+    group.terms["collision_obstacle_boxes_b"] = ObservationTermCfg(
+      func=mdp.obstacle_boxes_in_robot_frame,
+      params=obstacle_params,
+    )
+    group.terms["privileged_object_center_b"] = ObservationTermCfg(
+      func=mdp.object_position_in_robot_frame,
+      params={"minimum_curriculum_stage": 1},
+    )
+    group.terms["table_approach_target_b"] = ObservationTermCfg(
+      func=mdp.zero_vector,
+      params={"size": 3},
+    )
+    group.terms["placement_target_b"] = ObservationTermCfg(
+      func=mdp.zero_vector,
+      params={"size": 3},
+    )
+
+  cfg.rewards["standing_success"].params.update(
+    {
+      "required_duration_s": 5.0,
+      "maximum_projected_gravity_xy": 0.15,
+      "maximum_linear_speed": 0.05,
+      "maximum_angular_speed": 0.10,
+    }
+  )
+
+  disabled_weights = {name: 0.0 for name in cfg.rewards}
+  standing_weights = {
+    **disabled_weights,
+    "termination_penalty": -200.0,
+    "dof_pos_limits": -1.0,
+    "action_magnitude_l2": -0.02,
+    "action_rate_l2": -0.05,
+    "joint_vel_hinge": -0.02,
+    "upright": 4.0,
+    "both_feet_contact": 2.0,
+    "standing_success": 10.0,
+    "base_motion": -1.0,
+    "base_drift": -4.0,
+    "foot_slip": -0.5,
+    "lower_body_pose": -0.5,
+    "lower_body_lateral_pose": -0.5,
+    "left_arm_pose": -0.5,
+    "right_arm_pose": -0.5,
+  }
+  grasp_weights = {
+    **disabled_weights,
+    "termination_penalty": -200.0,
+    "dof_pos_limits": -1.0,
+    "action_magnitude_l2": -0.02,
+    "action_rate_l2": -0.05,
+    "joint_vel_hinge": -0.02,
+    "upright": 3.0,
+    "both_feet_contact": 1.0,
+    "standing_success": 1.0,
+    "base_motion": -0.5,
+    "base_drift": -4.0,
+    "foot_slip": -0.5,
+    "lower_body_pose": -0.3,
+    "lower_body_lateral_pose": -0.5,
+    "left_arm_pose": -0.5,
+    "right_arm_pose": -0.05,
+    "approach_object": 4.0,
+    "multi_link_contact": 5.0,
+    "lift_progress": 10.0,
+    "grasp_lift_success": 12.0,
+  }
+  for reward_name, weight in standing_weights.items():
+    cfg.rewards[reward_name].weight = weight
+
+  # Keep the inactive scene upright and physically well-conditioned on its own
+  # support surface.  Moving it underground would penetrate MuJoCo's infinite
+  # ground plane; moving it laterally removes it from the robot without that
+  # contact artifact.
+  hidden_pose_range = {"x": (HIDDEN_SCENE_X_OFFSET_M, HIDDEN_SCENE_X_OFFSET_M)}
+  active_object_pose_range = {
+    "x": (-0.06, 0.06),
+    "y": (-0.06, 0.06),
+    "yaw": (-math.pi, math.pi),
+  }
+  cfg.curriculum = {
+    "task_stage": CurriculumTermCfg(
+      func=mdp.performance_stage_curriculum,
+      params={
+        "stage_reward_weights": (standing_weights, grasp_weights),
+        "promotion_reward_names": ("standing_success",),
+        "promotion_success_rates": (0.80,),
+        "evaluation_episodes": (4096,),
+        "initial_stage": 0,
+        "stage_termination_params": (
+          {"object_lost": {"minimum_height": -100.0}},
+          {
+            "object_lost": {
+              "minimum_height": TABLE_TOP_HEIGHT_M - 0.12,
+            }
+          },
+        ),
+        "stage_event_params": (
+          {
+            "reset_table_root": {"pose_range": hidden_pose_range},
+            "reset_object_on_pickup_zone": {"pose_range": hidden_pose_range},
+          },
+          {
+            "reset_table_root": {"pose_range": {}},
+            "reset_object_on_pickup_zone": {
+              "pose_range": active_object_pose_range
+            },
+          },
         ),
       },
     )

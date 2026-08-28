@@ -68,6 +68,8 @@ fi
 if [[ -n "${RESUME_CHECKPOINT_PATH}" || -n "${INIT_CHECKPOINT_PATH}" ]]; then
   case "${TASK}" in
     *Position-Tracking*) EXPERIMENT_NAME="talos_tabletop_position_tracking" ;;
+    *Stationary-Grasp-Cube*) EXPERIMENT_NAME="talos_tabletop_stationary_grasp_cube" ;;
+    *Stationary-Grasp-Sphere*) EXPERIMENT_NAME="talos_tabletop_stationary_grasp_sphere" ;;
     *Cube*) EXPERIMENT_NAME="talos_tabletop_grasp_cube_privileged_position" ;;
     *Sphere*) EXPERIMENT_NAME="talos_tabletop_grasp_sphere_privileged_position" ;;
     *) echo "Cannot infer experiment name for resume task: ${TASK}" >&2; exit 2 ;;

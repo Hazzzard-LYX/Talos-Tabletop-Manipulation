@@ -5,7 +5,9 @@ from talos_tabletop.tasks.tabletop import mdp
 from talos_tabletop.tasks.tabletop.env_cfg import (
   MAX_COLLISION_OBSTACLES,
   ROBOT_SPAWN_POSITION_M,
+  TABLE_TOP_HEIGHT_M,
   talos_tabletop_grasp_env_cfg,
+  talos_tabletop_stationary_grasp_env_cfg,
 )
 
 
@@ -74,5 +76,43 @@ def test_normal_foot_landing_does_not_reset_or_move_object() -> None:
     assert (
       env.termination_manager.get_term_cfg("object_lost").params["minimum_height"] > 0.0
     )
+  finally:
+    env.close()
+
+
+def test_stationary_grasp_curriculum_restores_scene_after_standing() -> None:
+  cfg = talos_tabletop_stationary_grasp_env_cfg(object_shape="cube", play=False)
+  cfg.scene.num_envs = 2
+  cfg.curriculum["task_stage"].params["evaluation_episodes"] = (2,)
+  env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+  try:
+    observations, _ = env.reset(seed=5)
+    env.sim.forward()
+    curriculum = env.curriculum_manager.get_term_cfg("task_stage").func
+
+    assert curriculum.current_stage == 0
+    assert torch.all(env.scene["table"].data.root_link_pos_w[:, 0] > 5.0)
+    assert torch.all(env.scene["object"].data.root_link_pos_w[:, 0] > 5.0)
+    assert torch.count_nonzero(
+      observations["actor"][..., 117:117 + MAX_COLLISION_OBSTACLES * 11]
+    ) == 0
+
+    env.episode_length_buf[:] = 1
+    env.reward_manager._episode_sums["standing_success"][:] = 1.0
+    env._reset_idx(torch.arange(2))
+    env.sim.forward()
+
+    assert curriculum.current_stage == 1
+    assert torch.allclose(
+      env.scene["table"].data.root_link_pos_w[:, 2],
+      torch.full((2,), 0.82),
+      atol=1.0e-5,
+    )
+    assert torch.all(
+      env.scene["object"].data.root_link_pos_w[:, 2] > TABLE_TOP_HEIGHT_M
+    )
+    assert env.reward_manager.get_term_cfg("approach_object").weight == 4.0
+    assert env.reward_manager.get_term_cfg("navigation_progress").weight == 0.0
+    assert env.reward_manager.get_term_cfg("place_success").weight == 0.0
   finally:
     env.close()
