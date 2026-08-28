@@ -71,6 +71,8 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   )
   assert cfg.scene.env_spacing == 0.0
   assert "reset_robot_root" in cfg.events
+  assert "reset_table_root" in cfg.events
+  assert cfg.events["reset_table_root"].params["pose_range"] == {}
   assert cfg.events["reset_robot_joints"].params["position_range"] == (0.0, 0.0)
   assert cfg.rewards["approach_object"].weight == 0.0
   assert cfg.rewards["multi_link_contact"].weight == 0.0

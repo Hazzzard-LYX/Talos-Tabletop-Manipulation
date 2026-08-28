@@ -562,6 +562,15 @@ def talos_tabletop_grasp_env_cfg(
       "velocity_range": (0.0, 0.0),
     }
   )
+  cfg.events["reset_table_root"] = EventTermCfg(
+    mode="reset",
+    func=mdp.reset_root_state_uniform,
+    params={
+      "asset_cfg": SceneEntityCfg("table", body_names=("table",)),
+      "pose_range": {},
+      "velocity_range": {},
+    },
+  )
   cfg.events["reset_object_on_pickup_zone"] = EventTermCfg(
     mode="reset",
     func=mdp.reset_root_state_uniform,
