@@ -1,6 +1,7 @@
 """TALOS tabletop reaching and privileged-position grasping tasks."""
 
 import math
+from typing import Literal
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -46,6 +47,9 @@ ROBOT_SPAWN_POSITION_M = (
 )
 TABLE_APPROACH_BASE_XY_M = (0.0, 0.0)
 MAX_COLLISION_OBSTACLES = 8
+LOCOMOTION_PERIOD_S = 0.8
+FOOT_SWING_TARGET_HEIGHT_M = 0.09
+ControlMode = Literal["position_tracking", "manipulation"]
 
 
 def make_tabletop_reaching_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -463,6 +467,7 @@ def talos_tabletop_reaching_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def talos_tabletop_grasp_env_cfg(
   object_shape: ObjectShape = "cube",
   play: bool = False,
+  control_mode: ControlMode = "position_tracking",
 ) -> ManagerBasedRlEnvCfg:
   """Create phase-1 right-hand grasping with exact object-center input.
 
@@ -534,6 +539,18 @@ def talos_tabletop_grasp_env_cfg(
   cfg.observations["critic"].terms.update(actor_terms)
   cfg.observations["critic"].terms["base_lin_vel"] = ObservationTermCfg(
     func=mdp.base_lin_vel
+  )
+  # Keep the original actor/critic columns unchanged and append the two new
+  # dimensions.  This makes balance-checkpoint migration an exact zero-column
+  # expansion of the first policy layer.
+  phase_term = ObservationTermCfg(
+    func=mdp.locomotion_phase,
+    params={"period": LOCOMOTION_PERIOD_S, "control_mode": control_mode},
+  )
+  cfg.observations["actor"].terms["locomotion_phase"] = phase_term
+  cfg.observations["critic"].terms["locomotion_phase"] = ObservationTermCfg(
+    func=mdp.locomotion_phase,
+    params={"period": LOCOMOTION_PERIOD_S, "control_mode": control_mode},
   )
 
   action = cfg.actions["joint_pos"]
@@ -610,6 +627,7 @@ def talos_tabletop_grasp_env_cfg(
     fields=("found", "force"),
     reduce="netforce",
     num_slots=1,
+    track_air_time=True,
   )
   # Feet and ankle bodies must remain legal terrain contacts.  The previous
   # broad ``leg_.*_link`` expression included both feet and reset every world
@@ -647,6 +665,12 @@ def talos_tabletop_grasp_env_cfg(
   cfg.scene.sensors = (right_contact, feet_ground, body_ground, body_table)
 
   lower_body = SceneEntityCfg("robot", joint_names=(r"leg_.*_joint",))
+  lower_body_lateral = SceneEntityCfg(
+    "robot", joint_names=(r"leg_.*_(1|2)_joint",)
+  )
+  foot_sites = SceneEntityCfg(
+    "robot", site_names=("left_foot", "right_foot")
+  )
   left_arm = SceneEntityCfg("robot", joint_names=(r"arm_left_.*_joint",))
   right_arm = SceneEntityCfg("robot", joint_names=(r"arm_right_.*_joint",))
   cfg.rewards = {
@@ -662,6 +686,15 @@ def talos_tabletop_grasp_env_cfg(
       func=mdp.both_feet_contact,
       weight=2.0,
       params={"sensor_name": feet_ground.name},
+    ),
+    "both_feet_near_target": RewardTermCfg(
+      func=mdp.both_feet_contact_near_target,
+      weight=0.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "distance_threshold": 0.35,
+      },
     ),
     "standing_success": RewardTermCfg(
       func=mdp.sustained_standing_success,
@@ -689,6 +722,7 @@ def talos_tabletop_grasp_env_cfg(
       weight=0.0,
       params={
         "target_position": TABLE_APPROACH_BASE_XY_M,
+        "heading_target_position": (TABLE_CENTER_X_M, 0.0),
         "maximum_speed": 0.25,
         "maximum_projected_gravity_xy": 0.25,
         "sensor_name": feet_ground.name,
@@ -700,11 +734,72 @@ def talos_tabletop_grasp_env_cfg(
       weight=0.0,
       params={
         "target_position": TABLE_APPROACH_BASE_XY_M,
+        "heading_target_position": (TABLE_CENTER_X_M, 0.0),
         "minimum_speed": 0.05,
         "target_speed": 0.20,
         "maximum_projected_gravity_xy": 0.25,
         "sensor_name": feet_ground.name,
         "minimum_height": 0.85,
+      },
+    ),
+    "face_table": RewardTermCfg(
+      func=mdp.base_facing_target_exp,
+      weight=0.0,
+      params={
+        "target_position": (TABLE_CENTER_X_M, 0.0),
+        "std": math.radians(20.0),
+      },
+    ),
+    "lateral_base_velocity": RewardTermCfg(
+      func=mdp.base_lateral_velocity_l2,
+      weight=0.0,
+    ),
+    "gait_contact": RewardTermCfg(
+      func=mdp.feet_gait_contact_tracking,
+      weight=0.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "period": LOCOMOTION_PERIOD_S,
+        "offsets": (0.0, 0.5),
+        "stance_ratio": 0.60,
+        "stop_distance": 0.35,
+      },
+    ),
+    "swing_peak_height": RewardTermCfg(
+      func=mdp.feet_swing_peak_height,
+      weight=0.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "target_height": FOOT_SWING_TARGET_HEIGHT_M,
+        "std": 0.025,
+        "minimum_air_time": 0.08,
+        "stop_distance": 0.35,
+        "asset_cfg": foot_sites,
+      },
+    ),
+    "foot_slip": RewardTermCfg(
+      func=mdp.contact_foot_slip_l2,
+      weight=0.0,
+      params={"sensor_name": feet_ground.name, "asset_cfg": foot_sites},
+    ),
+    "healthy_gait_success": RewardTermCfg(
+      func=mdp.sustained_healthy_gait_success,
+      weight=0.0,
+      params={
+        "sensor_name": feet_ground.name,
+        "target_position": TABLE_APPROACH_BASE_XY_M,
+        "heading_target_position": (TABLE_CENTER_X_M, 0.0),
+        "required_duration_s": 0.5,
+        "minimum_radial_speed": 0.08,
+        "maximum_radial_speed": 0.30,
+        "maximum_projected_gravity_xy": 0.25,
+        "maximum_heading_error": math.radians(20.0),
+        "maximum_contact_slip_speed": 0.08,
+        "minimum_height": 0.85,
+        "minimum_step_air_time": 0.08,
+        "foot_asset_cfg": foot_sites,
       },
     ),
     "reach_table_success": RewardTermCfg(
@@ -718,12 +813,22 @@ def talos_tabletop_grasp_env_cfg(
         "maximum_projected_gravity_xy": 0.25,
         "maximum_linear_speed": 0.30,
         "maximum_angular_speed": 0.40,
+        "heading_target_position": (TABLE_CENTER_X_M, 0.0),
+        "maximum_heading_error": math.radians(15.0),
+        "maximum_contact_slip_speed": 0.05,
+        "minimum_step_air_time": 0.08,
+        "foot_asset_cfg": foot_sites,
       },
     ),
     "lower_body_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
       weight=-0.5,
       params={"asset_cfg": lower_body},
+    ),
+    "lower_body_lateral_pose": RewardTermCfg(
+      func=mdp.joint_deviation_l2,
+      weight=0.0,
+      params={"asset_cfg": lower_body_lateral},
     ),
     "left_arm_pose": RewardTermCfg(
       func=mdp.joint_deviation_l2,
@@ -841,14 +946,22 @@ def talos_tabletop_grasp_env_cfg(
       **safety_weights,
       "upright": 4.0,
       "both_feet_contact": 2.0,
+      "both_feet_near_target": 0.0,
       "standing_success": 5.0,
       "base_motion": -0.10,
       "base_drift": -4.0,
       "navigate_to_table": 0.0,
       "navigation_progress": 0.0,
       "navigation_speed": 0.0,
+      "face_table": 0.0,
+      "lateral_base_velocity": 0.0,
+      "gait_contact": 0.0,
+      "swing_peak_height": 0.0,
+      "foot_slip": -0.2,
+      "healthy_gait_success": 0.0,
       "reach_table_success": 0.0,
       "lower_body_pose": -0.5,
+      "lower_body_lateral_pose": -0.5,
       "left_arm_pose": -0.5,
       "right_arm_pose": -0.5,
       "approach_object": 0.0,
@@ -866,15 +979,23 @@ def talos_tabletop_grasp_env_cfg(
       "joint_vel_hinge": -0.01,
       "termination_penalty": -1000.0,
       "upright": 1.5,
-      "both_feet_contact": 0.5,
+      "both_feet_contact": 0.0,
+      "both_feet_near_target": 0.5,
       "standing_success": 0.1,
       "base_motion": 0.0,
       "base_drift": 0.0,
       "navigate_to_table": 0.0,
       "navigation_progress": 8.0,
       "navigation_speed": 1.0,
+      "face_table": 2.0,
+      "lateral_base_velocity": -1.0,
+      "gait_contact": 0.5,
+      "swing_peak_height": 5.0,
+      "foot_slip": -0.5,
+      "healthy_gait_success": 1.0,
       "reach_table_success": 10.0,
       "lower_body_pose": -0.05,
+      "lower_body_lateral_pose": -0.2,
       "left_arm_pose": -0.1,
       "right_arm_pose": -0.1,
       "approach_object": 0.0,
@@ -888,14 +1009,22 @@ def talos_tabletop_grasp_env_cfg(
       **safety_weights,
       "upright": 2.0,
       "both_feet_contact": 1.0,
+      "both_feet_near_target": 0.0,
       "standing_success": 1.0,
       "base_motion": -0.05,
       "base_drift": 0.0,
       "navigate_to_table": 0.0,
       "navigation_progress": 1.0,
       "navigation_speed": 0.5,
+      "face_table": 0.5,
+      "lateral_base_velocity": -0.5,
+      "gait_contact": 0.0,
+      "swing_peak_height": 0.0,
+      "foot_slip": -0.2,
+      "healthy_gait_success": 0.0,
       "reach_table_success": 1.0,
       "lower_body_pose": -0.2,
+      "lower_body_lateral_pose": -0.5,
       "left_arm_pose": -0.2,
       "right_arm_pose": -0.1,
       "approach_object": 4.0,
@@ -909,14 +1038,22 @@ def talos_tabletop_grasp_env_cfg(
       **safety_weights,
       "upright": 2.0,
       "both_feet_contact": 1.0,
+      "both_feet_near_target": 0.0,
       "standing_success": 1.0,
       "base_motion": -0.05,
       "base_drift": 0.0,
       "navigate_to_table": 0.0,
       "navigation_progress": 0.5,
       "navigation_speed": 0.25,
+      "face_table": 0.5,
+      "lateral_base_velocity": -0.5,
+      "gait_contact": 0.0,
+      "swing_peak_height": 0.0,
+      "foot_slip": -0.2,
+      "healthy_gait_success": 0.0,
       "reach_table_success": 0.5,
       "lower_body_pose": -0.2,
+      "lower_body_lateral_pose": -0.5,
       "left_arm_pose": -0.2,
       "right_arm_pose": -0.1,
       "approach_object": 1.0,
@@ -962,4 +1099,67 @@ def talos_tabletop_grasp_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.scene.num_envs = 1
     cfg.episode_length_s = int(1e9)
+  return cfg
+
+
+def talos_tabletop_position_tracking_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Train only the position-tracking mode before manipulation is introduced.
+
+  Stage 0 must demonstrate a healthy alternating gait.  Stage 1 learns the
+  complete three-metre approach and remains the terminal curriculum stage, so
+  this task cannot silently advance into grasp/manipulation rewards.
+  """
+  cfg = talos_tabletop_grasp_env_cfg(
+    object_shape="cube",
+    play=play,
+    control_mode="position_tracking",
+  )
+  full_params = cfg.curriculum["task_stage"].params
+  navigation_weights = dict(full_params["stage_reward_weights"][1])
+  gait_acquisition_weights = {
+    **navigation_weights,
+    "upright": 2.0,
+    "both_feet_near_target": 0.0,
+    "standing_success": 0.0,
+    "navigation_progress": 4.0,
+    "navigation_speed": 1.0,
+    "face_table": 2.0,
+    "lateral_base_velocity": -1.0,
+    "gait_contact": 0.75,
+    "swing_peak_height": 5.0,
+    "foot_slip": -0.75,
+    "healthy_gait_success": 10.0,
+    "reach_table_success": 0.0,
+    "lower_body_lateral_pose": -0.3,
+  }
+  position_tracking_weights = {
+    **navigation_weights,
+    "both_feet_contact": 0.0,
+    "both_feet_near_target": 0.5,
+    "healthy_gait_success": 1.0,
+  }
+  stage_reward_weights = (
+    gait_acquisition_weights,
+    position_tracking_weights,
+  )
+  for reward_name, weight in gait_acquisition_weights.items():
+    cfg.rewards[reward_name].weight = weight
+  cfg.curriculum = {
+    "task_stage": CurriculumTermCfg(
+      func=mdp.performance_stage_curriculum,
+      params={
+        "stage_reward_weights": stage_reward_weights,
+        "promotion_reward_names": ("healthy_gait_success",),
+        "promotion_success_rates": (0.70,),
+        "evaluation_episodes": (4096,),
+        "initial_stage": 0,
+        "stage_termination_params": (
+          {"object_lost": {"minimum_height": -10.0}},
+          {"object_lost": {"minimum_height": -10.0}},
+        ),
+      },
+    )
+  }
   return cfg

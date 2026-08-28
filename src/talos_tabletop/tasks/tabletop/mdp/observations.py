@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from mjlab.entity import Entity
@@ -18,6 +18,30 @@ _DEFAULT_OBJECT_CFG = SceneEntityCfg("object")
 # actor input size.  Each slot is:
 #   center_b xyz, half_extents xyz, orientation_b wxyz, occupied flag.
 OBSTACLE_BOX_FEATURE_DIM = 11
+
+
+def locomotion_phase(
+  env: ManagerBasedRlEnv,
+  period: float,
+  control_mode: Literal["position_tracking", "manipulation"],
+) -> torch.Tensor:
+  """Encode the walking clock and reserve an explicit stationary mode.
+
+  Position tracking uses a unit-circle phase signal.  Manipulation returns the
+  otherwise unreachable zero vector, so the same network interface can later
+  represent a stationary manipulation controller without adding another
+  constant observation that would collapse under running normalization.
+  """
+  if period <= 0.0:
+    raise ValueError("locomotion period must be positive")
+  if control_mode == "manipulation":
+    return torch.zeros((env.num_envs, 2), device=env.device, dtype=torch.float)
+  if control_mode != "position_tracking":
+    raise ValueError(f"Unsupported control mode: {control_mode}")
+
+  phase = (env.episode_length_buf * env.step_dt) % period / period
+  angle = 2.0 * torch.pi * phase
+  return torch.stack((torch.sin(angle), torch.cos(angle)), dim=1)
 
 
 def commands_gen(

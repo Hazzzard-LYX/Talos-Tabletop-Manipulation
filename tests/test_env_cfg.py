@@ -3,9 +3,12 @@ import re
 import pytest
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from talos_tabletop.tasks.tabletop.env_cfg import (
+  FOOT_SWING_TARGET_HEIGHT_M,
+  LOCOMOTION_PERIOD_S,
   MAX_COLLISION_OBSTACLES,
   ROBOT_SPAWN_POSITION_M,
   talos_tabletop_grasp_env_cfg,
+  talos_tabletop_position_tracking_env_cfg,
   talos_tabletop_reaching_env_cfg,
 )
 
@@ -49,6 +52,10 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert "placement_target_b" in cfg.observations["actor"].terms
   assert "base_lin_vel" not in cfg.observations["actor"].terms
   assert "base_lin_vel" in cfg.observations["critic"].terms
+  assert cfg.observations["actor"].terms["locomotion_phase"].params == {
+    "period": LOCOMOTION_PERIOD_S,
+    "control_mode": "position_tracking",
+  }
   assert {sensor.name for sensor in cfg.scene.sensors} == {
     "right_gripper_object_contact",
     "feet_ground_contact",
@@ -59,6 +66,11 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
     "standing_success",
     "navigate_to_table",
     "navigation_speed",
+    "gait_contact",
+    "swing_peak_height",
+    "foot_slip",
+    "face_table",
+    "healthy_gait_success",
     "reach_table_success",
     "approach_object",
     "multi_link_contact",
@@ -94,12 +106,18 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert navigation_weights["navigate_to_table"] == 0.0
   assert navigation_weights["navigation_progress"] == 8.0
   assert navigation_weights["navigation_speed"] == 1.0
+  assert navigation_weights["both_feet_contact"] == 0.0
+  assert navigation_weights["gait_contact"] == 0.5
+  assert navigation_weights["swing_peak_height"] == 5.0
+  assert navigation_weights["foot_slip"] == -0.5
+  assert navigation_weights["face_table"] == 2.0
   assert navigation_weights["standing_success"] == 0.1
   assert navigation_weights["base_motion"] == 0.0
   assert navigation_weights["termination_penalty"] == -1000.0
   assert cfg.rewards["navigate_to_table"].params["std"] == 3.0
   assert cfg.rewards["navigation_speed"].params == {
     "target_position": pytest.approx((0.0, 0.0)),
+    "heading_target_position": pytest.approx((0.75, 0.0)),
     "minimum_speed": 0.05,
     "target_speed": 0.20,
     "maximum_projected_gravity_xy": 0.25,
@@ -116,3 +134,28 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   )
   assert re.fullmatch(body_ground.primary.pattern, "leg_left_4_link")
   assert not re.fullmatch(body_ground.primary.pattern, "leg_left_6_link")
+  feet_ground = next(
+    sensor for sensor in cfg.scene.sensors if sensor.name == "feet_ground_contact"
+  )
+  assert feet_ground.track_air_time
+  assert cfg.rewards["swing_peak_height"].params["target_height"] == pytest.approx(
+    FOOT_SWING_TARGET_HEIGHT_M
+  )
+
+
+def test_position_tracking_task_stops_before_manipulation_mode() -> None:
+  cfg = talos_tabletop_position_tracking_env_cfg()
+  params = cfg.curriculum["task_stage"].params
+
+  assert params["initial_stage"] == 0
+  assert params["promotion_reward_names"] == ("healthy_gait_success",)
+  assert params["promotion_success_rates"] == (0.70,)
+  assert len(params["stage_reward_weights"]) == 2
+  gait_weights, tracking_weights = params["stage_reward_weights"]
+  assert gait_weights["healthy_gait_success"] == 10.0
+  assert gait_weights["reach_table_success"] == 0.0
+  assert tracking_weights["reach_table_success"] == 10.0
+  assert tracking_weights["approach_object"] == 0.0
+  assert cfg.observations["actor"].terms["locomotion_phase"].params[
+    "control_mode"
+  ] == "position_tracking"

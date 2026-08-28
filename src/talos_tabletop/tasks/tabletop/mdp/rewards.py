@@ -8,7 +8,12 @@ from mjlab.entity import Entity
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
-from mjlab.utils.lab_api.math import quat_conjugate, quat_error_magnitude, quat_mul
+from mjlab.utils.lab_api.math import (
+  quat_apply_inverse,
+  quat_conjugate,
+  quat_error_magnitude,
+  quat_mul,
+)
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -175,6 +180,213 @@ def _per_foot_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
   return per_foot
 
 
+def _target_xy_w(
+  env: ManagerBasedRlEnv,
+  target_position: tuple[float, float],
+) -> torch.Tensor:
+  target_xy = torch.tensor(
+    target_position, device=env.device, dtype=torch.float
+  ).repeat(env.num_envs, 1)
+  return target_xy + env.scene.env_origins[:, :2]
+
+
+def _heading_error_to_target(
+  env: ManagerBasedRlEnv,
+  asset: Entity,
+  target_position: tuple[float, float],
+) -> torch.Tensor:
+  """Return signed yaw error from the robot forward axis to a world target."""
+  target_xy = _target_xy_w(env, target_position)
+  offset_w = target_xy - asset.data.root_link_pos_w[:, :2]
+  offset_w_3d = torch.cat(
+    (offset_w, torch.zeros((env.num_envs, 1), device=env.device)), dim=1
+  )
+  offset_b = quat_apply_inverse(asset.data.root_link_quat_w, offset_w_3d)
+  return torch.atan2(offset_b[:, 1], offset_b[:, 0])
+
+
+def _foot_slip_speeds(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  asset: Entity = env.scene[asset_cfg.name]
+  contact = _per_foot_contact(env, sensor_name)
+  foot_velocity_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]
+  if foot_velocity_xy.shape[1] != contact.shape[1]:
+    raise ValueError("Foot sites and contact primaries must have matching counts.")
+  slip_speed = torch.linalg.vector_norm(foot_velocity_xy, dim=2)
+  return slip_speed, contact
+
+
+def feet_gait_contact_tracking(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  target_position: tuple[float, float],
+  period: float,
+  offsets: tuple[float, float],
+  stance_ratio: float,
+  stop_distance: float,
+) -> torch.Tensor:
+  """Reward alternating foot contacts according to a periodic biped gait."""
+  if period <= 0.0:
+    raise ValueError("gait period must be positive")
+  if len(offsets) != 2:
+    raise ValueError("biped gait requires exactly two phase offsets")
+  if not 0.0 < stance_ratio < 1.0:
+    raise ValueError("stance_ratio must be in (0, 1)")
+
+  contact = _per_foot_contact(env, sensor_name)
+  if contact.shape[1] != len(offsets):
+    raise ValueError("gait offsets must match the configured feet")
+  global_phase = ((env.episode_length_buf * env.step_dt) % period / period).unsqueeze(1)
+  phase_offsets = torch.tensor(offsets, device=env.device, dtype=torch.float)
+  expected_stance = ((global_phase + phase_offsets) % 1.0) < stance_ratio
+  match_fraction = (expected_stance == contact).float().mean(dim=1)
+
+  asset: Entity = env.scene[_DEFAULT_ASSET_CFG.name]
+  target_xy = _target_xy_w(env, target_position)
+  distance = torch.linalg.vector_norm(
+    asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
+  )
+  active = distance > stop_distance
+  env.extras["log"]["Metrics/gait_contact_match"] = match_fraction.mean()
+  return match_fraction * active.float()
+
+
+def contact_foot_slip_l2(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Penalize horizontal velocity of feet that are carrying ground contact."""
+  slip_speed, contact = _foot_slip_speeds(env, sensor_name, asset_cfg)
+  cost = torch.sum(torch.square(slip_speed) * contact.float(), dim=1)
+  count = contact.float().sum().clamp_min(1.0)
+  mean_slip = torch.sum(slip_speed * contact.float()) / count
+  env.extras["log"]["Metrics/foot_slip_speed_mps"] = mean_slip
+  return cost
+
+
+class feet_swing_peak_height:
+  """Reward swing-foot peak height when a genuine airborne step lands."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+    num_feet = len(asset_cfg.site_ids)
+    self._peak_height = torch.zeros(
+      (env.num_envs, num_feet), device=env.device, dtype=torch.float
+    )
+    self._was_airborne = torch.zeros(
+      (env.num_envs, num_feet), device=env.device, dtype=torch.bool
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    target_position: tuple[float, float],
+    target_height: float,
+    std: float,
+    minimum_air_time: float,
+    stop_distance: float,
+    asset_cfg: SceneEntityCfg,
+  ) -> torch.Tensor:
+    if target_height <= 0.0 or std <= 0.0:
+      raise ValueError("target_height and std must be positive")
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    if not isinstance(sensor, ContactSensor):
+      raise TypeError(f"'{sensor_name}' must be a ContactSensor.")
+    if sensor.data.last_air_time is None:
+      raise RuntimeError("Foot contact sensor must enable track_air_time.")
+
+    contact = _per_foot_contact(env, sensor_name)
+    foot_height = (
+      asset.data.site_pos_w[:, asset_cfg.site_ids, 2]
+      - env.scene.env_origins[:, 2].unsqueeze(1)
+    )
+    airborne = ~contact
+    self._peak_height = torch.where(
+      airborne,
+      torch.maximum(self._peak_height, foot_height),
+      self._peak_height,
+    )
+    self._was_airborne |= airborne
+    first_contact = sensor.compute_first_contact(dt=env.step_dt)
+    valid_landing = (
+      first_contact
+      & self._was_airborne
+      & (sensor.data.last_air_time >= minimum_air_time)
+    )
+    landing_reward = torch.exp(
+      -torch.square((self._peak_height - target_height) / std)
+    ) * valid_landing.float()
+
+    target_xy = _target_xy_w(env, target_position)
+    distance = torch.linalg.vector_norm(
+      asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
+    )
+    reward = landing_reward.sum(dim=1) * (distance > stop_distance).float()
+    landing_count = valid_landing.float().sum().clamp_min(1.0)
+    env.extras["log"]["Metrics/swing_peak_height_m"] = (
+      (self._peak_height * valid_landing.float()).sum() / landing_count
+    )
+    self._peak_height = torch.where(
+      first_contact, torch.zeros_like(self._peak_height), self._peak_height
+    )
+    self._was_airborne = torch.where(
+      first_contact, torch.zeros_like(self._was_airborne), self._was_airborne
+    )
+    return reward
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._peak_height[env_ids] = 0.0
+    self._was_airborne[env_ids] = False
+
+
+def base_facing_target_exp(
+  env: ManagerBasedRlEnv,
+  target_position: tuple[float, float],
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward the robot for pointing its forward axis at the table."""
+  if std <= 0.0:
+    raise ValueError("heading std must be positive")
+  asset: Entity = env.scene[asset_cfg.name]
+  error = _heading_error_to_target(env, asset, target_position)
+  env.extras["log"]["Metrics/table_heading_error_rad"] = torch.abs(error).mean()
+  return torch.exp(-torch.square(error / std))
+
+
+def base_lateral_velocity_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize sideways base velocity in the robot frame."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.square(asset.data.root_link_lin_vel_b[:, 1])
+
+
+def both_feet_contact_near_target(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  target_position: tuple[float, float],
+  distance_threshold: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward a double-support stop only after reaching the target area."""
+  asset: Entity = env.scene[asset_cfg.name]
+  target_xy = _target_xy_w(env, target_position)
+  close = torch.linalg.vector_norm(
+    asset.data.root_link_pos_w[:, :2] - target_xy, dim=1
+  ) <= distance_threshold
+  return both_feet_contact(env, sensor_name) * close.float()
+
+
 def _stable_standing_mask(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -230,6 +442,8 @@ class sustained_standing_success:
     return success.float()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
     self._counter[env_ids] = 0
 
 
@@ -285,15 +499,13 @@ class base_target_progress:
     target_position: tuple[float, float],
     maximum_speed: float,
     maximum_projected_gravity_xy: float,
+    heading_target_position: tuple[float, float] | None = None,
     sensor_name: str | None = None,
     minimum_height: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    target_xy = torch.tensor(
-      target_position, device=env.device, dtype=torch.float
-    ).repeat(env.num_envs, 1)
-    target_xy += env.scene.env_origins[:, :2]
+    target_xy = _target_xy_w(env, target_position)
     planar_speed, radial_velocity = _base_target_radial_velocity(asset, target_xy)
     radial_velocity = radial_velocity.clamp(-maximum_speed, maximum_speed)
     tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
@@ -302,6 +514,10 @@ class base_target_progress:
     if sensor_name is not None:
       supported = _per_foot_contact(env, sensor_name).any(dim=1)
     valid_posture = supported & (asset.data.root_link_pos_w[:, 2] >= minimum_height)
+    heading_gate = torch.ones(env.num_envs, device=env.device)
+    if heading_target_position is not None:
+      heading_error = _heading_error_to_target(env, asset, heading_target_position)
+      heading_gate = torch.cos(heading_error).clamp(0.0, 1.0)
     env.extras["log"]["Metrics/base_lin_vel_x_mps"] = (
       asset.data.root_link_vel_w[:, 0].mean()
     )
@@ -315,7 +531,8 @@ class base_target_progress:
     env.extras["log"]["Metrics/navigation_reward_gate"] = (
       valid_posture.float().mean()
     )
-    return radial_velocity * upright_scale * valid_posture.float()
+    env.extras["log"]["Metrics/navigation_heading_gate"] = heading_gate.mean()
+    return radial_velocity * heading_gate * upright_scale * valid_posture.float()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     del env_ids
@@ -327,6 +544,7 @@ def base_target_speed_above_threshold(
   minimum_speed: float,
   target_speed: float,
   maximum_projected_gravity_xy: float,
+  heading_target_position: tuple[float, float] | None = None,
   sensor_name: str | None = None,
   minimum_height: float = 0.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -335,10 +553,7 @@ def base_target_speed_above_threshold(
   if not 0.0 <= minimum_speed < target_speed:
     raise ValueError("Expected 0 <= minimum_speed < target_speed.")
   asset: Entity = env.scene[asset_cfg.name]
-  target_xy = torch.tensor(
-    target_position, device=env.device, dtype=torch.float
-  ).repeat(env.num_envs, 1)
-  target_xy += env.scene.env_origins[:, :2]
+  target_xy = _target_xy_w(env, target_position)
   _, radial_velocity = _base_target_radial_velocity(asset, target_xy)
   speed_scale = (
     (radial_velocity - minimum_speed) / (target_speed - minimum_speed)
@@ -349,7 +564,90 @@ def base_target_speed_above_threshold(
   if sensor_name is not None:
     supported = _per_foot_contact(env, sensor_name).any(dim=1)
   valid_posture = supported & (asset.data.root_link_pos_w[:, 2] >= minimum_height)
-  return speed_scale * upright_scale * valid_posture.float()
+  heading_gate = torch.ones(env.num_envs, device=env.device)
+  if heading_target_position is not None:
+    heading_error = _heading_error_to_target(env, asset, heading_target_position)
+    heading_gate = torch.cos(heading_error).clamp(0.0, 1.0)
+  return speed_scale * heading_gate * upright_scale * valid_posture.float()
+
+
+class sustained_healthy_gait_success:
+  """Sparse success after both feet complete healthy target-directed steps."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._required_steps = max(
+      1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
+    )
+    sensor = env.scene[cfg.params["sensor_name"]]
+    if not isinstance(sensor, ContactSensor):
+      raise TypeError("Healthy gait success requires a foot ContactSensor.")
+    self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._completed_steps = torch.zeros(
+      (env.num_envs, len(sensor.primary_names)),
+      dtype=torch.bool,
+      device=env.device,
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    target_position: tuple[float, float],
+    heading_target_position: tuple[float, float],
+    required_duration_s: float,
+    minimum_radial_speed: float,
+    maximum_radial_speed: float,
+    maximum_projected_gravity_xy: float,
+    maximum_heading_error: float,
+    maximum_contact_slip_speed: float,
+    minimum_height: float,
+    minimum_step_air_time: float,
+    foot_asset_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    del required_duration_s
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    if not isinstance(sensor, ContactSensor) or sensor.data.last_air_time is None:
+      raise RuntimeError("Healthy gait success requires tracked foot air time.")
+
+    valid_landing = sensor.compute_first_contact(dt=env.step_dt) & (
+      sensor.data.last_air_time >= minimum_step_air_time
+    )
+    self._completed_steps |= valid_landing
+    target_xy = _target_xy_w(env, target_position)
+    _, radial_velocity = _base_target_radial_velocity(asset, target_xy)
+    tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
+    heading_error = torch.abs(
+      _heading_error_to_target(env, asset, heading_target_position)
+    )
+    slip_speed, contact = _foot_slip_speeds(env, sensor_name, foot_asset_cfg)
+    contact_slip = torch.where(contact, slip_speed, torch.zeros_like(slip_speed))
+    low_slip = contact_slip.amax(dim=1) <= maximum_contact_slip_speed
+    supported = contact.any(dim=1)
+    healthy = (
+      self._completed_steps.all(dim=1)
+      & supported
+      & (radial_velocity >= minimum_radial_speed)
+      & (radial_velocity <= maximum_radial_speed)
+      & (tilt <= maximum_projected_gravity_xy)
+      & (heading_error <= maximum_heading_error)
+      & low_slip
+      & (asset.data.root_link_pos_w[:, 2] >= minimum_height)
+    )
+    self._counter = torch.where(healthy, self._counter + 1, 0)
+    success = self._counter >= self._required_steps
+    env.extras["log"]["Metrics/healthy_gait_success"] = success.float().mean()
+    env.extras["log"]["Metrics/healthy_gait_steps_completed"] = (
+      self._completed_steps.float().mean()
+    )
+    return success.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._counter[env_ids] = 0
+    self._completed_steps[env_ids] = False
 
 
 class sustained_navigation_success:
@@ -360,6 +658,14 @@ class sustained_navigation_success:
       1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
     )
     self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    sensor = env.scene[cfg.params["sensor_name"]]
+    if not isinstance(sensor, ContactSensor):
+      raise TypeError("Navigation success requires a foot ContactSensor.")
+    self._completed_steps = torch.zeros(
+      (env.num_envs, len(sensor.primary_names)),
+      dtype=torch.bool,
+      device=env.device,
+    )
 
   def __call__(
     self,
@@ -371,14 +677,16 @@ class sustained_navigation_success:
     maximum_projected_gravity_xy: float,
     maximum_linear_speed: float,
     maximum_angular_speed: float,
+    heading_target_position: tuple[float, float],
+    maximum_heading_error: float,
+    maximum_contact_slip_speed: float,
+    minimum_step_air_time: float,
+    foot_asset_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
     del required_duration_s
     asset: Entity = env.scene[asset_cfg.name]
-    target_xy = torch.tensor(
-      target_position, device=env.device, dtype=torch.float
-    ).repeat(env.num_envs, 1)
-    target_xy += env.scene.env_origins[:, :2]
+    target_xy = _target_xy_w(env, target_position)
     close = (
       torch.linalg.vector_norm(asset.data.root_link_pos_w[:, :2] - target_xy, dim=1)
       <= distance_threshold
@@ -391,13 +699,36 @@ class sustained_navigation_success:
       maximum_angular_speed,
       asset_cfg,
     )
-    self._counter = torch.where(close & stable, self._counter + 1, 0)
+    sensor = env.scene[sensor_name]
+    if not isinstance(sensor, ContactSensor) or sensor.data.last_air_time is None:
+      raise RuntimeError("Navigation success requires tracked foot air time.")
+    valid_landing = sensor.compute_first_contact(dt=env.step_dt) & (
+      sensor.data.last_air_time >= minimum_step_air_time
+    )
+    self._completed_steps |= valid_landing
+    heading_error = torch.abs(
+      _heading_error_to_target(env, asset, heading_target_position)
+    )
+    slip_speed, contact = _foot_slip_speeds(env, sensor_name, foot_asset_cfg)
+    contact_slip = torch.where(contact, slip_speed, torch.zeros_like(slip_speed))
+    low_slip = contact_slip.amax(dim=1) <= maximum_contact_slip_speed
+    healthy_arrival = (
+      close
+      & stable
+      & (heading_error <= maximum_heading_error)
+      & low_slip
+      & self._completed_steps.all(dim=1)
+    )
+    self._counter = torch.where(healthy_arrival, self._counter + 1, 0)
     success = self._counter >= self._required_steps
     env.extras["log"]["Metrics/navigation_success"] = success.float().mean()
     return success.float()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
     self._counter[env_ids] = 0
+    self._completed_steps[env_ids] = False
 
 
 def object_target_distance_tanh(

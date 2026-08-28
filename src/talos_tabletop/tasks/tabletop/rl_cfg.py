@@ -52,3 +52,12 @@ def talos_tabletop_grasp_ppo_runner_cfg(
   cfg.save_interval = 250
   cfg.max_iterations = 20_000
   return cfg
+
+
+def talos_tabletop_position_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """Return the position-tracking-only runner configuration."""
+  cfg = talos_tabletop_ppo_runner_cfg()
+  cfg.experiment_name = "talos_tabletop_position_tracking"
+  cfg.save_interval = 250
+  cfg.max_iterations = 20_000
+  return cfg

@@ -22,6 +22,7 @@ SHORT_REVISION="$(git -C "${PROJECT_ROOT}" rev-parse --short=12 HEAD)"
 RUN_NAME="${RUN_NAME:-${SHORT_REVISION}-${NUM_ENVS}env}"
 RUN_ROOT="${WORKSPACE}/logs/talos-tabletop-training/${SHORT_REVISION}/${SLURM_JOB_ID}"
 RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-}"
+INIT_CHECKPOINT_PATH="${INIT_CHECKPOINT_PATH:-}"
 INITIAL_STAGE="${INITIAL_STAGE:-0}"
 
 export TMPDIR="${SLURM_TMPDIR:-${WORKSPACE}/tmp/${SLURM_JOB_ID}}"
@@ -38,6 +39,10 @@ echo "Environments: ${NUM_ENVS}"
 echo "Iterations: ${MAX_ITERATIONS}"
 echo "Checkpoint interval: ${SAVE_INTERVAL}"
 echo "Initial curriculum stage: ${INITIAL_STAGE}"
+if [[ -n "${RESUME_CHECKPOINT_PATH}" && -n "${INIT_CHECKPOINT_PATH}" ]]; then
+  echo "RESUME_CHECKPOINT_PATH and INIT_CHECKPOINT_PATH are mutually exclusive." >&2
+  exit 2
+fi
 nvidia-smi
 
 test -x "${PYTHON}"
@@ -60,13 +65,17 @@ if [[ "${INITIAL_STAGE}" != "0" ]]; then
   )
 fi
 
-if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
-  test -f "${RESUME_CHECKPOINT_PATH}"
+if [[ -n "${RESUME_CHECKPOINT_PATH}" || -n "${INIT_CHECKPOINT_PATH}" ]]; then
   case "${TASK}" in
+    *Position-Tracking*) EXPERIMENT_NAME="talos_tabletop_position_tracking" ;;
     *Cube*) EXPERIMENT_NAME="talos_tabletop_grasp_cube_privileged_position" ;;
     *Sphere*) EXPERIMENT_NAME="talos_tabletop_grasp_sphere_privileged_position" ;;
     *) echo "Cannot infer experiment name for resume task: ${TASK}" >&2; exit 2 ;;
   esac
+fi
+
+if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
+  test -f "${RESUME_CHECKPOINT_PATH}"
   RESUME_RUN="resume_source"
   RESUME_DIR="${RUN_ROOT}/${EXPERIMENT_NAME}/${RESUME_RUN}"
   mkdir -p "${RESUME_DIR}"
@@ -77,6 +86,25 @@ if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
     --agent.load-checkpoint "model_resume.pt"
   )
   echo "Resume checkpoint: ${RESUME_CHECKPOINT_PATH}"
+fi
+
+if [[ -n "${INIT_CHECKPOINT_PATH}" ]]; then
+  test -f "${INIT_CHECKPOINT_PATH}"
+  RESUME_RUN="init_source"
+  RESUME_DIR="${RUN_ROOT}/${EXPERIMENT_NAME}/${RESUME_RUN}"
+  mkdir -p "${RESUME_DIR}"
+  "${PYTHON}" slurm/migrate_grasp_checkpoint.py \
+    --input "${INIT_CHECKPOINT_PATH}" \
+    --output "${RESUME_DIR}/model_init.pt" \
+    --actor-added-dims 2 \
+    --critic-added-dims 2
+  export TALOS_INIT_WEIGHTS_ONLY=1
+  TRAIN_ARGS+=(
+    --agent.resume True
+    --agent.load-run "${RESUME_RUN}"
+    --agent.load-checkpoint "model_init.pt"
+  )
+  echo "Initialize weights from checkpoint: ${INIT_CHECKPOINT_PATH}"
 fi
 
 "${PYTHON}" slurm/train_grasp.py "${TRAIN_ARGS[@]}"

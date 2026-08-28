@@ -9,6 +9,26 @@ class _Scene(dict):
   env_origins: torch.Tensor
 
 
+def test_locomotion_phase_distinguishes_tracking_and_manipulation_modes() -> None:
+  env = SimpleNamespace(
+    num_envs=2,
+    device="cpu",
+    step_dt=0.02,
+    episode_length_buf=torch.tensor([0, 10]),
+  )
+
+  tracking = mdp.locomotion_phase(
+    env, period=0.8, control_mode="position_tracking"
+  )
+  manipulation = mdp.locomotion_phase(
+    env, period=0.8, control_mode="manipulation"
+  )
+
+  assert tracking.shape == (2, 2)
+  assert torch.allclose(torch.linalg.vector_norm(tracking, dim=1), torch.ones(2))
+  assert torch.count_nonzero(manipulation) == 0
+
+
 def test_navigation_progress_uses_measured_radial_velocity() -> None:
   root_position = torch.tensor([[-2.6, 0.0, 1.0]])
   root_velocity = torch.zeros((1, 6))
@@ -82,3 +102,36 @@ def test_navigation_speed_has_zero_reward_below_deadband() -> None:
   assert mdp.base_target_speed_above_threshold(
     env, minimum_height=0.85, **params
   ).item() == 0.0
+
+
+def test_navigation_progress_is_gated_by_facing_the_table() -> None:
+  robot = SimpleNamespace(
+    data=SimpleNamespace(
+      root_link_pos_w=torch.tensor([[-2.6, 0.0, 1.0]]),
+      root_link_vel_w=torch.tensor([[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+      root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+      projected_gravity_b=torch.tensor([[0.0, 0.0, -1.0]]),
+    )
+  )
+  scene = _Scene(robot=robot)
+  scene.env_origins = torch.zeros((1, 3))
+  env = SimpleNamespace(
+    num_envs=1,
+    device="cpu",
+    scene=scene,
+    extras={"log": {}},
+  )
+  term = mdp.base_target_progress(cfg=None, env=env)
+  params = {
+    "target_position": (0.0, 0.0),
+    "heading_target_position": (0.75, 0.0),
+    "maximum_speed": 0.25,
+    "maximum_projected_gravity_xy": 0.25,
+  }
+
+  assert term(env, **params).item() == pytest.approx(0.2)
+  half_sqrt = 2.0**-0.5
+  robot.data.root_link_quat_w[:] = torch.tensor(
+    [[half_sqrt, 0.0, 0.0, half_sqrt]]
+  )
+  assert term(env, **params).item() == pytest.approx(0.0, abs=1.0e-6)
