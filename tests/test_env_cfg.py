@@ -141,6 +141,11 @@ def test_grasp_cfg_uses_full_body_balance_and_privileged_object_center() -> None
   assert cfg.rewards["swing_peak_height"].params["target_height"] == pytest.approx(
     FOOT_SWING_TARGET_HEIGHT_M
   )
+  healthy_gait_params = cfg.rewards["healthy_gait_success"].params
+  assert healthy_gait_params["minimum_swing_peak_height"] == pytest.approx(0.075)
+  assert healthy_gait_params["maximum_swing_peak_height"] == pytest.approx(0.105)
+  assert healthy_gait_params["gait_offsets"] == (0.0, 0.5)
+  assert healthy_gait_params["minimum_gait_contact_match"] == pytest.approx(0.75)
 
 
 def test_position_tracking_task_stops_before_manipulation_mode() -> None:

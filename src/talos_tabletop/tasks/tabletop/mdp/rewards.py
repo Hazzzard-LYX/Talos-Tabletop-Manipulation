@@ -572,7 +572,7 @@ def base_target_speed_above_threshold(
 
 
 class sustained_healthy_gait_success:
-  """Sparse success after both feet complete healthy target-directed steps."""
+  """Sparse success after both feet complete phase-aligned healthy steps."""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
     self._required_steps = max(
@@ -587,6 +587,15 @@ class sustained_healthy_gait_success:
       dtype=torch.bool,
       device=env.device,
     )
+    self._peak_height = torch.zeros_like(self._completed_steps, dtype=torch.float)
+    self._was_airborne = torch.zeros_like(self._completed_steps)
+    self._gait_match_ema = torch.zeros(
+      env.num_envs, dtype=torch.float, device=env.device
+    )
+    gait_match_window_s = cfg.params["gait_match_window_s"]
+    if gait_match_window_s <= 0.0:
+      raise ValueError("gait_match_window_s must be positive")
+    self._gait_match_alpha = min(1.0, env.step_dt / gait_match_window_s)
 
   def __call__(
     self,
@@ -602,31 +611,86 @@ class sustained_healthy_gait_success:
     maximum_contact_slip_speed: float,
     minimum_height: float,
     minimum_step_air_time: float,
+    minimum_swing_peak_height: float,
+    maximum_swing_peak_height: float,
+    gait_period: float,
+    gait_offsets: tuple[float, float],
+    gait_stance_ratio: float,
+    gait_match_window_s: float,
+    minimum_gait_contact_match: float,
     foot_asset_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
-    del required_duration_s
+    del required_duration_s, gait_match_window_s
+    if gait_period <= 0.0:
+      raise ValueError("gait_period must be positive")
+    if len(gait_offsets) != self._completed_steps.shape[1]:
+      raise ValueError("gait_offsets must match the configured feet")
+    if not 0.0 < gait_stance_ratio < 1.0:
+      raise ValueError("gait_stance_ratio must be in (0, 1)")
+    if not 0.0 <= minimum_gait_contact_match <= 1.0:
+      raise ValueError("minimum_gait_contact_match must be in [0, 1]")
+    if not 0.0 < minimum_swing_peak_height < maximum_swing_peak_height:
+      raise ValueError("swing peak height bounds must be positive and ordered")
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
     if not isinstance(sensor, ContactSensor) or sensor.data.last_air_time is None:
       raise RuntimeError("Healthy gait success requires tracked foot air time.")
 
-    valid_landing = sensor.compute_first_contact(dt=env.step_dt) & (
+    contact = _per_foot_contact(env, sensor_name)
+    foot_height = (
+      asset.data.site_pos_w[:, foot_asset_cfg.site_ids, 2]
+      - env.scene.env_origins[:, 2].unsqueeze(1)
+    )
+    airborne = ~contact
+    self._peak_height = torch.where(
+      airborne,
+      torch.maximum(self._peak_height, foot_height),
+      self._peak_height,
+    )
+    self._was_airborne |= airborne
+    first_contact = sensor.compute_first_contact(dt=env.step_dt)
+    valid_landing = first_contact & self._was_airborne & (
       sensor.data.last_air_time >= minimum_step_air_time
     )
-    self._completed_steps |= valid_landing
+    healthy_landing = (
+      valid_landing
+      & (self._peak_height >= minimum_swing_peak_height)
+      & (self._peak_height <= maximum_swing_peak_height)
+    )
+    self._completed_steps |= healthy_landing
+    self._peak_height = torch.where(
+      first_contact, torch.zeros_like(self._peak_height), self._peak_height
+    )
+    self._was_airborne = torch.where(
+      first_contact, torch.zeros_like(self._was_airborne), self._was_airborne
+    )
+
+    global_phase = (
+      (env.episode_length_buf * env.step_dt) % gait_period / gait_period
+    ).unsqueeze(1)
+    phase_offsets = torch.tensor(
+      gait_offsets, device=env.device, dtype=torch.float
+    )
+    expected_stance = (
+      (global_phase + phase_offsets) % 1.0
+    ) < gait_stance_ratio
+    gait_match = (expected_stance == contact).float().mean(dim=1)
+    self._gait_match_ema.lerp_(gait_match, self._gait_match_alpha)
+
     target_xy = _target_xy_w(env, target_position)
     _, radial_velocity = _base_target_radial_velocity(asset, target_xy)
     tilt = torch.linalg.vector_norm(asset.data.projected_gravity_b[:, :2], dim=1)
     heading_error = torch.abs(
       _heading_error_to_target(env, asset, heading_target_position)
     )
-    slip_speed, contact = _foot_slip_speeds(env, sensor_name, foot_asset_cfg)
+    slip_speed, _ = _foot_slip_speeds(env, sensor_name, foot_asset_cfg)
     contact_slip = torch.where(contact, slip_speed, torch.zeros_like(slip_speed))
     low_slip = contact_slip.amax(dim=1) <= maximum_contact_slip_speed
     supported = contact.any(dim=1)
     healthy = (
       self._completed_steps.all(dim=1)
+      & (self._gait_match_ema >= minimum_gait_contact_match)
       & supported
       & (radial_velocity >= minimum_radial_speed)
       & (radial_velocity <= maximum_radial_speed)
@@ -641,6 +705,9 @@ class sustained_healthy_gait_success:
     env.extras["log"]["Metrics/healthy_gait_steps_completed"] = (
       self._completed_steps.float().mean()
     )
+    env.extras["log"]["Metrics/healthy_gait_contact_match_ema"] = (
+      self._gait_match_ema.mean()
+    )
     return success.float()
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
@@ -648,6 +715,9 @@ class sustained_healthy_gait_success:
       env_ids = slice(None)
     self._counter[env_ids] = 0
     self._completed_steps[env_ids] = False
+    self._peak_height[env_ids] = 0.0
+    self._was_airborne[env_ids] = False
+    self._gait_match_ema[env_ids] = 0.0
 
 
 class sustained_navigation_success:
