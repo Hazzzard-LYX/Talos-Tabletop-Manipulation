@@ -20,6 +20,7 @@ def main() -> None:
   parser.add_argument("--checkpoint", type=Path, required=True)
   parser.add_argument("--task", default="Mjlab-Tabletop-Grasp-Cube-Talos-v0")
   parser.add_argument("--num-envs", type=int, default=1)
+  parser.add_argument("--env-spacing", type=float, default=5.0)
   parser.add_argument("--port", type=int, default=18080)
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--device", default="cpu")
@@ -29,11 +30,14 @@ def main() -> None:
     raise FileNotFoundError(args.checkpoint)
   if args.num_envs <= 0:
     raise ValueError("num-envs must be positive")
+  if args.env_spacing <= 0.0:
+    raise ValueError("env-spacing must be positive")
 
   configure_torch_backends()
   env_cfg = load_env_cfg(args.task, play=True)
   agent_cfg = load_rl_cfg(args.task)
   env_cfg.scene.num_envs = args.num_envs
+  env_cfg.scene.env_spacing = args.env_spacing
   env_cfg.seed = args.seed
 
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
@@ -51,6 +55,7 @@ def main() -> None:
   print(f"CHECKPOINT={args.checkpoint}", flush=True)
   print(f"LIVESTREAM_PORT={args.port}", flush=True)
   print(f"NUM_ENVS={args.num_envs}", flush=True)
+  print(f"ENV_SPACING={args.env_spacing}", flush=True)
   server = viser.ViserServer(
     host="0.0.0.0",
     port=args.port,

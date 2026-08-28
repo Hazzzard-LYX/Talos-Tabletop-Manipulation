@@ -10,14 +10,16 @@
 set -euo pipefail
 
 WORKSPACE="${HOME}/IAS_Workspace"
-PROJECT_ROOT="${WORKSPACE}/projects/Talos-Tabletop-Manipulation"
+PROJECT_ROOT="${PROJECT_ROOT:-${WORKSPACE}/projects/Talos-Tabletop-Manipulation}"
 PYTHON="${WORKSPACE}/envs/mjlab-cu128/bin/python"
 TRAIN_JOB_ID="${TRAIN_JOB_ID:?Submit with TRAIN_JOB_ID=<job-id>}"
 TRAIN_REVISION="${TRAIN_REVISION:?Submit with TRAIN_REVISION=<12-char-revision>}"
 TASK="${TASK:-Mjlab-Tabletop-Grasp-Cube-Talos-v0}"
 CHECKPOINT_ITERATION="${CHECKPOINT_ITERATION:-25}"
 NUM_ENVS="${NUM_ENVS:-1}"
+ENV_SPACING="${ENV_SPACING:-5.0}"
 REMOTE_PORT="${REMOTE_PORT:-18080}"
+DEVICE="${DEVICE:-cpu}"
 WAIT_SECONDS="${WAIT_SECONDS:-1800}"
 TRAIN_ROOT="${WORKSPACE}/logs/talos-tabletop-training/${TRAIN_REVISION}/${TRAIN_JOB_ID}"
 
@@ -51,5 +53,6 @@ cd "${PROJECT_ROOT}"
   --checkpoint "${checkpoint}" \
   --task "${TASK}" \
   --num-envs "${NUM_ENVS}" \
+  --env-spacing "${ENV_SPACING}" \
   --port "${REMOTE_PORT}" \
-  --device cpu
+  --device "${DEVICE}"
