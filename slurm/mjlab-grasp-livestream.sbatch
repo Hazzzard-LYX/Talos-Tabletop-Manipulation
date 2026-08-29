@@ -18,6 +18,7 @@ TASK="${TASK:-Mjlab-Tabletop-Grasp-Cube-Talos-v0}"
 CHECKPOINT_ITERATION="${CHECKPOINT_ITERATION:-25}"
 NUM_ENVS="${NUM_ENVS:-1}"
 ENV_SPACING="${ENV_SPACING:-5.0}"
+INITIAL_STAGE="${INITIAL_STAGE:-0}"
 REMOTE_PORT="${REMOTE_PORT:-18080}"
 DEVICE="${DEVICE:-cpu}"
 WAIT_SECONDS="${WAIT_SECONDS:-1800}"
@@ -31,6 +32,7 @@ mkdir -p "${TMPDIR}" "${WARP_CACHE_PATH}"
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: $(hostname)"
 echo "Task: ${TASK}"
+echo "Initial curriculum stage: ${INITIAL_STAGE}"
 echo "Waiting for model_${CHECKPOINT_ITERATION}.pt below ${TRAIN_ROOT}"
 
 deadline="$((SECONDS + WAIT_SECONDS))"
@@ -54,5 +56,6 @@ cd "${PROJECT_ROOT}"
   --task "${TASK}" \
   --num-envs "${NUM_ENVS}" \
   --env-spacing "${ENV_SPACING}" \
+  --initial-stage "${INITIAL_STAGE}" \
   --port "${REMOTE_PORT}" \
   --device "${DEVICE}"

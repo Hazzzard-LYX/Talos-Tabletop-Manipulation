@@ -9,6 +9,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
   quat_apply_inverse,
   quat_conjugate,
   quat_error_magnitude,
@@ -116,26 +117,308 @@ def gripper_object_contact(
   return (contacts / float(contacts_for_full_reward)).clamp(max=1.0)
 
 
+def _contact_face_metrics(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  object_half_extents: tuple[float, float, float] | None,
+  minimum_force: float,
+  contacts_for_full_area: int,
+  links_for_full_area: int,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Estimate rigid-contact face coverage, force closure, and persistence.
+
+  MuJoCo exposes contact points rather than a compliant contact patch area.  For
+  a cube, the proxy rewards force-bearing contact slots whose normals align with
+  a principal object face and whose points lie away from face edges.  Coverage
+  across distinct gripper links approximates contact area; balanced forces on
+  opposite object faces approximate force closure.
+  """
+  cache_key = (
+    env.common_step_counter,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg.name,
+  )
+  cached = getattr(env, "_talos_face_contact_metrics_cache", None)
+  if cached is not None and cached[0] == cache_key:
+    return cached[1]
+
+  sensor = env.scene[sensor_name]
+  if not isinstance(sensor, ContactSensor):
+    raise TypeError(f"'{sensor_name}' must be a ContactSensor.")
+  data = sensor.data
+  if any(field is None for field in (data.found, data.force, data.pos, data.normal)):
+    raise TypeError(
+      f"'{sensor_name}' must provide found, force, pos, and normal contact data."
+    )
+
+  assert data.found is not None
+  assert data.force is not None
+  assert data.pos is not None
+  assert data.normal is not None
+  obj: Entity = env.scene[object_cfg.name]
+  batch_size, contact_slots = data.found.shape
+  object_quat = obj.data.root_link_quat_w[:, None, :].expand(-1, contact_slots, -1)
+  object_pos = obj.data.root_link_pos_w[:, None, :]
+  normal_object = quat_apply_inverse(
+    object_quat.reshape(-1, 4), data.normal.reshape(-1, 3)
+  ).reshape(batch_size, contact_slots, 3)
+  contact_pos_object = quat_apply_inverse(
+    object_quat.reshape(-1, 4), (data.pos - object_pos).reshape(-1, 3)
+  ).reshape(batch_size, contact_slots, 3)
+
+  force_magnitude = torch.linalg.vector_norm(data.force, dim=-1)
+  active = (data.found > 0) & (force_magnitude >= minimum_force)
+  normal_abs = torch.abs(normal_object)
+
+  if object_half_extents is None:
+    face_alignment = torch.ones_like(force_magnitude)
+    interior_margin = torch.ones_like(force_magnitude)
+  else:
+    half_extents = torch.tensor(
+      object_half_extents, device=env.device, dtype=contact_pos_object.dtype
+    )
+    dominant_axis = normal_abs.argmax(dim=-1)
+    face_alignment = (
+      (normal_abs.amax(dim=-1) - math.sqrt(0.5)) / (1.0 - math.sqrt(0.5))
+    ).clamp(min=0.0, max=1.0)
+    tangent_mask = 1.0 - torch.nn.functional.one_hot(
+      dominant_axis, num_classes=3
+    ).to(contact_pos_object.dtype)
+    tangent_position = torch.abs(contact_pos_object) / half_extents
+    maximum_tangent_position = (tangent_position * tangent_mask).amax(dim=-1)
+    interior_margin = (1.0 - maximum_tangent_position).clamp(min=0.0, max=1.0)
+
+  slot_quality = active.float() * face_alignment * interior_margin
+  slot_coverage = (
+    slot_quality.sum(dim=1) / float(contacts_for_full_area)
+  ).clamp(max=1.0)
+
+  slots_per_primary = sensor.cfg.num_slots
+  primary_count = len(sensor.primary_names)
+  if contact_slots != primary_count * slots_per_primary:
+    raise ValueError("Contact slots do not match primary-major sensor layout.")
+  primary_quality = slot_quality.reshape(
+    batch_size, primary_count, slots_per_primary
+  ).amax(dim=-1)
+  link_coverage = (
+    (primary_quality > 0.0).float().sum(dim=1) / float(links_for_full_area)
+  ).clamp(max=1.0)
+  area_proxy = slot_coverage * link_coverage
+
+  force_quality = (
+    active.float()
+    * face_alignment
+    * interior_margin
+    * (force_magnitude / max(minimum_force * 4.0, 1.0e-6)).clamp(max=1.0)
+  )
+  positive_side = (
+    force_quality[..., None] * normal_object.clamp(min=0.0)
+  ).amax(dim=1)
+  negative_side = (
+    force_quality[..., None] * (-normal_object).clamp(min=0.0)
+  ).amax(dim=1)
+  force_closure = torch.minimum(positive_side, negative_side).amax(dim=1)
+
+  if data.current_contact_time is None:
+    persistence = torch.ones(batch_size, device=env.device)
+  else:
+    persistent_links = torch.topk(
+      data.current_contact_time, k=min(2, data.current_contact_time.shape[1]), dim=1
+    ).values
+    persistence = persistent_links.amin(dim=1)
+
+  env.extras["log"]["Metrics/face_contact_area_proxy"] = area_proxy.mean()
+  env.extras["log"]["Metrics/force_closure"] = force_closure.mean()
+  env.extras["log"]["Metrics/grasp_contact_persistence_s"] = persistence.mean()
+  metrics = (area_proxy, force_closure, persistence)
+  env._talos_face_contact_metrics_cache = (cache_key, metrics)
+  return metrics
+
+
+def gripper_face_contact_area(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  object_half_extents: tuple[float, float, float] | None = None,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Reward broad force-bearing contacts in the interior of object faces."""
+  area, _, _ = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg,
+  )
+  return area
+
+
+def gripper_force_closure(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  object_half_extents: tuple[float, float, float] | None = None,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Reward balanced force-bearing contacts on opposite object faces."""
+  _, closure, _ = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg,
+  )
+  return closure
+
+
+def stable_face_grasp_success(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  object_half_extents: tuple[float, float, float] | None = None,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  minimum_area: float = 0.30,
+  minimum_force_closure: float = 0.25,
+  minimum_duration_s: float = 0.15,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Sparse success for a persistent, broad, force-closure grasp."""
+  area, closure, persistence = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg,
+  )
+  success = (
+    (area >= minimum_area)
+    & (closure >= minimum_force_closure)
+    & (persistence >= minimum_duration_s)
+  )
+  env.extras["log"]["Metrics/face_grasp_success"] = success.float().mean()
+  return success.float()
+
+
+def _object_lift_state(
+  obj: Entity,
+  initial_center_height: float,
+  table_height: float,
+  object_half_extents: tuple[float, float, float] | None,
+  sphere_radius: float | None,
+  clearance_margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  center_height = obj.data.root_link_pos_w[:, 2]
+  center_lift = center_height - initial_center_height
+  if object_half_extents is not None:
+    half_extents = torch.tensor(
+      object_half_extents, device=center_height.device, dtype=center_height.dtype
+    )
+    rotation = matrix_from_quat(obj.data.root_link_quat_w)
+    vertical_radius = (torch.abs(rotation[:, 2, :]) * half_extents).sum(dim=1)
+  elif sphere_radius is not None:
+    vertical_radius = torch.full_like(center_height, sphere_radius)
+  else:
+    raise ValueError("Specify object_half_extents or sphere_radius.")
+  bottom_clearance = (
+    center_height - vertical_radius - table_height - clearance_margin
+  ).clamp(min=0.0)
+  effective_lift = torch.minimum(center_lift.clamp(min=0.0), bottom_clearance)
+  return center_lift, bottom_clearance, effective_lift
+
+
 def object_lift_progress(
   env: ManagerBasedRlEnv,
   initial_center_height: float,
+  table_height: float,
   target_lift_height: float,
+  sensor_name: str,
+  object_half_extents: tuple[float, float, float] | None = None,
+  sphere_radius: float | None = None,
+  exponent: float = 2.0,
+  clearance_margin: float = 0.002,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  minimum_grasp_duration_s: float = 0.10,
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
-  """Return normalized upward progress from the object's tabletop pose."""
+  """Reward stable-grasp lift with quadratic, true-airborne height progress."""
   obj: Entity = env.scene[object_cfg.name]
-  lift = obj.data.root_link_pos_w[:, 2] - initial_center_height
-  progress = (lift / target_lift_height).clamp(min=0.0, max=1.0)
-  env.extras["log"]["Metrics/object_lift_height_m"] = lift.mean()
-  return progress
+  center_lift, clearance, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height,
+    table_height,
+    object_half_extents,
+    sphere_radius,
+    clearance_margin,
+  )
+  progress = (effective_lift / target_lift_height).clamp(max=1.0).pow(exponent)
+  area, closure, persistence = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg,
+  )
+  duration_gate = (persistence / minimum_grasp_duration_s).clamp(max=1.0)
+  grasp_gate = torch.sqrt((area * closure).clamp(min=0.0)) * duration_gate
+  env.extras["log"]["Metrics/object_com_lift_height_m"] = center_lift.mean()
+  env.extras["log"]["Metrics/object_lift_height_m"] = center_lift.mean()
+  env.extras["log"]["Metrics/object_bottom_clearance_m"] = clearance.mean()
+  env.extras["log"]["Metrics/object_effective_lift_m"] = effective_lift.mean()
+  env.extras["log"]["Metrics/stable_grasp_gate"] = grasp_gate.mean()
+  return progress * grasp_gate
+
+
+def excessive_object_lift_height(
+  env: ManagerBasedRlEnv,
+  initial_center_height: float,
+  maximum_center_lift_height: float = 0.30,
+  excess_scale: float = 0.10,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Quadratic hinge cost when object COM rises more than the safe limit."""
+  obj: Entity = env.scene[object_cfg.name]
+  center_lift = obj.data.root_link_pos_w[:, 2] - initial_center_height
+  excess = (center_lift - maximum_center_lift_height).clamp(min=0.0)
+  env.extras["log"]["Metrics/object_excessive_height_m"] = excess.mean()
+  return torch.square(excess / excess_scale).clamp(max=4.0)
 
 
 def grasp_and_lift_success(
   env: ManagerBasedRlEnv,
   sensor_name: str,
   initial_center_height: float,
+  table_height: float,
   minimum_lift_height: float,
   minimum_contacts: int = 2,
+  object_half_extents: tuple[float, float, float] | None = None,
+  sphere_radius: float | None = None,
+  clearance_margin: float = 0.002,
+  minimum_face_area: float = 0.30,
+  minimum_force_closure: float = 0.25,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  minimum_grasp_duration_s: float = 0.10,
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
   """Reward the transition state needed by the later transport policy."""
@@ -144,10 +427,30 @@ def grasp_and_lift_success(
     raise TypeError(f"'{sensor_name}' must provide ContactSensor found data.")
   obj: Entity = env.scene[object_cfg.name]
   enough_contacts = sensor.data.found.sum(dim=1) >= minimum_contacts
-  high_enough = (
-    obj.data.root_link_pos_w[:, 2] - initial_center_height
-  ) >= minimum_lift_height
-  success = enough_contacts & high_enough
+  _, _, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height,
+    table_height,
+    object_half_extents,
+    sphere_radius,
+    clearance_margin,
+  )
+  area, closure, persistence = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    object_cfg,
+  )
+  high_enough = effective_lift >= minimum_lift_height
+  stable_grasp = (
+    (area >= minimum_face_area)
+    & (closure >= minimum_force_closure)
+    & (persistence >= minimum_grasp_duration_s)
+  )
+  success = enough_contacts & high_enough & stable_grasp
   env.extras["log"]["Metrics/grasp_lift_success"] = success.float().mean()
   return success.float()
 

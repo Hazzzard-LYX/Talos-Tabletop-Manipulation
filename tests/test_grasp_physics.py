@@ -83,7 +83,7 @@ def test_normal_foot_landing_does_not_reset_or_move_object() -> None:
 def test_stationary_grasp_curriculum_restores_scene_after_standing() -> None:
   cfg = talos_tabletop_stationary_grasp_env_cfg(object_shape="cube", play=False)
   cfg.scene.num_envs = 2
-  cfg.curriculum["task_stage"].params["evaluation_episodes"] = (2,)
+  cfg.curriculum["task_stage"].params["evaluation_episodes"] = (2, 4096, 4096, 4096)
   env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
   try:
     observations, _ = env.reset(seed=5)
@@ -114,5 +114,22 @@ def test_stationary_grasp_curriculum_restores_scene_after_standing() -> None:
     assert env.reward_manager.get_term_cfg("approach_object").weight == 4.0
     assert env.reward_manager.get_term_cfg("navigation_progress").weight == 0.0
     assert env.reward_manager.get_term_cfg("place_success").weight == 0.0
+  finally:
+    env.close()
+
+
+def test_stationary_face_grasp_rewards_run_without_changing_observations() -> None:
+  cfg = talos_tabletop_stationary_grasp_env_cfg(object_shape="cube", play=False)
+  cfg.scene.num_envs = 1
+  cfg.curriculum["task_stage"].params["initial_stage"] = 2
+  env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+  try:
+    observations, _ = env.reset(seed=7)
+    assert observations["actor"].shape == (1, 222)
+    assert observations["critic"].shape == (1, 225)
+    env.step(torch.zeros((1, env.action_manager.total_action_dim)))
+    assert "Metrics/face_contact_area_proxy" in env.extras["log"]
+    assert "Metrics/force_closure" in env.extras["log"]
+    assert "Metrics/face_grasp_success" in env.extras["log"]
   finally:
     env.close()

@@ -168,23 +168,36 @@ def test_position_tracking_task_stops_before_manipulation_mode() -> None:
   ] == "position_tracking"
 
 
-def test_stationary_grasp_task_has_only_stand_and_lift_stages() -> None:
+def test_stationary_grasp_task_has_performance_gated_face_lift_stages() -> None:
   cfg = talos_tabletop_stationary_grasp_env_cfg()
   params = cfg.curriculum["task_stage"].params
 
   assert cfg.scene.entities["robot"].init_state.pos == pytest.approx(
     STATIONARY_GRASP_ROBOT_POSITION_M
   )
-  assert params["promotion_reward_names"] == ("standing_success",)
-  assert params["promotion_success_rates"] == (0.80,)
-  assert len(params["stage_reward_weights"]) == 2
-  standing_weights, grasp_weights = params["stage_reward_weights"]
+  assert params["promotion_reward_names"] == (
+    "standing_success",
+    "multi_link_contact",
+    "face_grasp_success",
+    "low_lift_success",
+  )
+  assert params["promotion_success_rates"] == (0.80, 0.70, 0.60, 0.50)
+  assert len(params["stage_reward_weights"]) == 5
+  standing_weights, approach_weights, face_weights, low_lift_weights, lift_weights = (
+    params["stage_reward_weights"]
+  )
   assert standing_weights["standing_success"] == 10.0
   assert standing_weights["approach_object"] == 0.0
-  assert grasp_weights["approach_object"] == 4.0
-  assert grasp_weights["multi_link_contact"] == 5.0
-  assert grasp_weights["lift_progress"] == 10.0
-  assert grasp_weights["grasp_lift_success"] == 12.0
+  assert approach_weights["approach_object"] == 4.0
+  assert approach_weights["multi_link_contact"] == 1.0
+  assert face_weights["face_contact_area"] == 5.0
+  assert face_weights["force_closure"] == 5.0
+  assert face_weights["lift_progress"] == 0.0
+  assert low_lift_weights["lift_progress"] == 15.0
+  assert low_lift_weights["low_lift_success"] == 12.0
+  assert lift_weights["lift_progress"] == 25.0
+  assert lift_weights["grasp_lift_success"] == 20.0
+  assert lift_weights["excessive_object_height"] == -20.0
   for weights in params["stage_reward_weights"]:
     assert weights["navigation_progress"] == 0.0
     assert weights["reach_table_success"] == 0.0
@@ -194,6 +207,8 @@ def test_stationary_grasp_task_has_only_stand_and_lift_stages() -> None:
     "x": (10.0, 10.0)
   }
   assert params["stage_event_params"][1]["reset_table_root"]["pose_range"] == {}
+  assert len(params["stage_event_params"]) == 5
+  assert len(params["stage_termination_params"]) == 5
   assert cfg.rewards["standing_success"].params["maximum_linear_speed"] == 0.05
   assert cfg.rewards["standing_success"].params["maximum_angular_speed"] == 0.10
   assert cfg.observations["actor"].terms["locomotion_phase"].params[
@@ -202,3 +217,5 @@ def test_stationary_grasp_task_has_only_stand_and_lift_stages() -> None:
   assert cfg.observations["actor"].terms[
     "privileged_object_center_b"
   ].params["minimum_curriculum_stage"] == 1
+  assert cfg.scene.sensors[0].fields == ("found", "force", "pos", "normal")
+  assert cfg.scene.sensors[0].track_air_time is True

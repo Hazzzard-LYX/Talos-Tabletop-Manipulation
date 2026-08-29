@@ -3,10 +3,64 @@ from types import SimpleNamespace
 import pytest
 import torch
 from talos_tabletop.tasks.tabletop import mdp
+from talos_tabletop.tasks.tabletop.mdp.rewards import _object_lift_state
 
 
 class _Scene(dict):
   env_origins: torch.Tensor
+
+
+def test_cube_tilt_does_not_count_as_airborne_lift() -> None:
+  half_sqrt = 2.0**-0.5
+  vertical_radius = (0.03**2 + 0.03**2) ** 0.5
+  obj = SimpleNamespace(
+    data=SimpleNamespace(
+      root_link_pos_w=torch.tensor([[0.0, 0.0, 0.86 + vertical_radius]]),
+      root_link_quat_w=torch.tensor([[half_sqrt + 1.0, 0.0, half_sqrt, 0.0]])
+      / (2.0 + 2.0 * half_sqrt) ** 0.5,
+    )
+  )
+
+  center_lift, clearance, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height=0.89,
+    table_height=0.86,
+    object_half_extents=(0.03, 0.03, 0.03),
+    sphere_radius=None,
+    clearance_margin=0.0,
+  )
+  assert center_lift.item() > 0.01
+  assert clearance.item() == pytest.approx(0.0, abs=1.0e-6)
+  assert effective_lift.item() == pytest.approx(0.0, abs=1.0e-6)
+
+  obj.data.root_link_pos_w[0, 2] += 0.05
+  _, clearance, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height=0.89,
+    table_height=0.86,
+    object_half_extents=(0.03, 0.03, 0.03),
+    sphere_radius=None,
+    clearance_margin=0.0,
+  )
+  assert clearance.item() == pytest.approx(0.05, abs=1.0e-6)
+  assert effective_lift.item() == pytest.approx(0.05, abs=1.0e-6)
+
+
+def test_excessive_height_penalty_starts_above_thirty_centimeters() -> None:
+  obj = SimpleNamespace(
+    data=SimpleNamespace(root_link_pos_w=torch.tensor([[0.0, 0.0, 1.19]]))
+  )
+  env = SimpleNamespace(
+    scene=_Scene(object=obj),
+    extras={"log": {}},
+  )
+  assert mdp.excessive_object_lift_height(
+    env, initial_center_height=0.89
+  ).item() == pytest.approx(0.0)
+  obj.data.root_link_pos_w[0, 2] = 1.24
+  assert mdp.excessive_object_lift_height(
+    env, initial_center_height=0.89
+  ).item() == pytest.approx(0.25)
 
 
 def test_locomotion_phase_distinguishes_tracking_and_manipulation_modes() -> None:

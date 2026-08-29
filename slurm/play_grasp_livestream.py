@@ -21,6 +21,7 @@ def main() -> None:
   parser.add_argument("--task", default="Mjlab-Tabletop-Grasp-Cube-Talos-v0")
   parser.add_argument("--num-envs", type=int, default=1)
   parser.add_argument("--env-spacing", type=float, default=5.0)
+  parser.add_argument("--initial-stage", type=int, default=0)
   parser.add_argument("--port", type=int, default=18080)
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--device", default="cpu")
@@ -36,11 +37,18 @@ def main() -> None:
   configure_torch_backends()
   env_cfg = load_env_cfg(args.task, play=True)
   agent_cfg = load_rl_cfg(args.task)
+  if "task_stage" in env_cfg.curriculum:
+    env_cfg.curriculum["task_stage"].params["initial_stage"] = args.initial_stage
   env_cfg.scene.num_envs = args.num_envs
   env_cfg.scene.env_spacing = args.env_spacing
   env_cfg.seed = args.seed
 
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
+  # The curriculum applies stage-specific event parameters after the environment's
+  # initial reset.  Reset once more so a nonzero play stage immediately restores
+  # scene entities such as the table and object.
+  if args.initial_stage > 0:
+    base_env.reset()
   env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
   runner_cls = load_runner_cls(args.task) or MjlabOnPolicyRunner
   runner = runner_cls(env, asdict(agent_cfg), device=args.device)
