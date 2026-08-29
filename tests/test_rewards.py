@@ -3,11 +3,114 @@ from types import SimpleNamespace
 import pytest
 import torch
 from talos_tabletop.tasks.tabletop import mdp
-from talos_tabletop.tasks.tabletop.mdp.rewards import _object_lift_state
+from talos_tabletop.tasks.tabletop.mdp import rewards as reward_functions
+from talos_tabletop.tasks.tabletop.mdp.rewards import (
+  _object_lift_state,
+  _paired_face_and_wrench_quality,
+)
 
 
 class _Scene(dict):
   env_origins: torch.Tensor
+
+
+def _paired_quality(
+  normals: torch.Tensor,
+  forces: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  return _paired_face_and_wrench_quality(
+    slot_quality=torch.ones((1, 2)),
+    normal_object=normals.unsqueeze(0),
+    force_object=forces.unsqueeze(0),
+    force_magnitude=torch.linalg.vector_norm(forces, dim=1).unsqueeze(0),
+    primary_count=2,
+    slots_per_primary=1,
+    contacts_for_full_area=2,
+    links_for_full_area=2,
+    minimum_force=0.25,
+    friction_coefficient=1.5,
+  )
+
+
+def test_one_sided_face_contacts_have_zero_grasp_quality() -> None:
+  paired_area, wrench_quality, grasp_quality = _paired_quality(
+    normals=torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+    forces=torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+  )
+  assert paired_area.item() == 0.0
+  assert wrench_quality.item() == 0.0
+  assert grasp_quality.item() == 0.0
+
+
+def test_balanced_antipodal_contacts_have_full_grasp_quality() -> None:
+  paired_area, wrench_quality, grasp_quality = _paired_quality(
+    normals=torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+    forces=torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+  )
+  assert paired_area.item() == pytest.approx(1.0)
+  assert wrench_quality.item() == pytest.approx(1.0)
+  assert grasp_quality.item() == pytest.approx(1.0)
+
+
+def test_sliding_antipodal_contacts_fail_task_wrench_check() -> None:
+  paired_area, wrench_quality, grasp_quality = _paired_quality(
+    normals=torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+    forces=torch.tensor([[0.25, 1.0, 0.0], [-0.25, 1.0, 0.0]]),
+  )
+  assert paired_area.item() == pytest.approx(1.0)
+  assert wrench_quality.item() == 0.0
+  assert grasp_quality.item() == 0.0
+
+
+def test_approach_record_progress_cannot_be_farmed_by_waiting() -> None:
+  robot = SimpleNamespace(
+    site_names=["grasp"],
+    data=SimpleNamespace(site_pos_w=torch.tensor([[[0.0, 0.0, 0.0]]])),
+  )
+  obj = SimpleNamespace(
+    data=SimpleNamespace(root_link_pos_w=torch.tensor([[1.0, 0.0, 0.0]]))
+  )
+  env = SimpleNamespace(
+    num_envs=1,
+    device="cpu",
+    step_dt=0.02,
+    scene=_Scene(robot=robot, object=obj),
+    extras={"log": {}},
+  )
+  term = mdp.site_object_record_progress(cfg=None, env=env)
+
+  assert term(env, site_name="grasp", std=1.0).item() == 0.0
+  obj.data.root_link_pos_w[0, 0] = 0.5
+  assert term(env, site_name="grasp", std=1.0).item() > 0.0
+  assert term(env, site_name="grasp", std=1.0).item() == 0.0
+
+
+def test_grasp_ready_success_emits_once_after_sustained_quality(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  env = SimpleNamespace(
+    num_envs=1,
+    device="cpu",
+    step_dt=0.02,
+    extras={"log": {}},
+  )
+  cfg = SimpleNamespace(params={"required_duration_s": 0.04})
+  quality = torch.tensor([1.0])
+  monkeypatch.setattr(
+    reward_functions,
+    "_contact_face_metrics",
+    lambda *args, **kwargs: (quality, quality, quality, quality),
+  )
+  term = mdp.sustained_grasp_ready_success(cfg=cfg, env=env)
+
+  params = {
+    "sensor_name": "contact",
+    "required_duration_s": 0.04,
+    "minimum_grasp_quality": 0.2,
+  }
+  assert term(env, **params).item() == 0.0
+  assert term(env, **params).item() == pytest.approx(1.0 / env.step_dt)
+  assert term(env, **params).item() == 0.0
 
 
 def test_cube_tilt_does_not_count_as_airborne_lift() -> None:

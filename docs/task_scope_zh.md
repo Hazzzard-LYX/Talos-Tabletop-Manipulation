@@ -17,10 +17,12 @@
    - 验证 TALOS、桌面、自由物体和接触传感器；
    - 腿部保持默认站立控制，policy 控制上身和夹爪；
    - 双手到达桌面工作空间中的目标位姿。
-2. **Phase 1：privileged-position 真实接触抓取**
+2. **Phase 1：privileged-position 可验证抓取**
    - 蓝色立方体或球体在绿色区域内随机初始化；
    - actor 和 critic 直接接收 robot root frame 下的物体中心真值；
-   - 使用右手接近、至少两处接触和抬升奖励；
+   - 接近、对向双面抓握质量和抬升采用 episode record-improvement 奖励，静止接触不能重复刷分；
+   - 抓握质量同时检查面内覆盖、对向法向、接触力平衡和摩擦锥安全余量；
+   - 课程依次验证稳定站立、抓握成形、2 cm micro-lift 持续保持和 8 cm 完整抬升；
    - 双腿由 policy 控制，base 不固定，机器人必须自主保持平衡；
 3. **Phase 2：视觉位置抓取**
    - actor 的三维物体中心输入改由视觉网络估计；

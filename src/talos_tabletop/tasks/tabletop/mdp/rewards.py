@@ -99,6 +99,59 @@ def site_object_distance_tanh(
   return 1.0 - torch.tanh(distance / std)
 
 
+class site_object_record_progress:
+  """Reward only new within-episode records in hand-object approach quality."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self._best = torch.zeros(env.num_envs, device=env.device)
+    self._initialized = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    site_name: str,
+    std: float,
+    robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    robot: Entity = env.scene[robot_cfg.name]
+    obj: Entity = env.scene[object_cfg.name]
+    site_id = robot.site_names.index(site_name)
+    distance = torch.linalg.vector_norm(
+      robot.data.site_pos_w[:, site_id] - obj.data.root_link_pos_w,
+      dim=1,
+    )
+    quality = 1.0 - torch.tanh(distance / std)
+    improvement = torch.where(
+      self._initialized,
+      (quality - self._best).clamp(min=0.0),
+      torch.zeros_like(quality),
+    )
+    self._best = torch.where(
+      self._initialized, torch.maximum(self._best, quality), quality
+    )
+    self._initialized[:] = True
+    env.extras["log"]["Metrics/approach_record_quality"] = self._best.mean()
+    env.extras["log"]["Metrics/approach_record_improvement"] = improvement.mean()
+    # MJLab integrates reward terms with step_dt.  Returning a rate makes the
+    # accumulated episode contribution equal the dimensionless improvement.
+    return improvement / env.step_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._best[env_ids] = 0.0
+    self._initialized[env_ids] = False
+
+
+def task_time(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Unit-rate term for a small task-completion time penalty."""
+  return torch.ones(env.num_envs, device=env.device)
+
+
 def gripper_object_contact(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -117,6 +170,88 @@ def gripper_object_contact(
   return (contacts / float(contacts_for_full_reward)).clamp(max=1.0)
 
 
+def _paired_face_and_wrench_quality(
+  slot_quality: torch.Tensor,
+  normal_object: torch.Tensor,
+  force_object: torch.Tensor,
+  force_magnitude: torch.Tensor,
+  primary_count: int,
+  slots_per_primary: int,
+  contacts_for_full_area: int,
+  links_for_full_area: int,
+  minimum_force: float,
+  friction_coefficient: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Compose opposite-face coverage and friction-safe wrench quality."""
+  batch_size = slot_quality.shape[0]
+  positive_alignment = normal_object.clamp(min=0.0)
+  negative_alignment = (-normal_object).clamp(min=0.0)
+  contacts_per_side = max(1, math.ceil(contacts_for_full_area / 2))
+  links_per_side = max(1, math.ceil(links_for_full_area / 2))
+  positive_slot_coverage = (
+    (slot_quality[..., None] * positive_alignment).sum(dim=1)
+    / float(contacts_per_side)
+  ).clamp(max=1.0)
+  negative_slot_coverage = (
+    (slot_quality[..., None] * negative_alignment).sum(dim=1)
+    / float(contacts_per_side)
+  ).clamp(max=1.0)
+  primary_slot_quality = slot_quality.reshape(
+    batch_size, primary_count, slots_per_primary, 1
+  )
+  primary_positive = (
+    primary_slot_quality
+    * positive_alignment.reshape(batch_size, primary_count, slots_per_primary, 3)
+  ).amax(dim=2)
+  primary_negative = (
+    primary_slot_quality
+    * negative_alignment.reshape(batch_size, primary_count, slots_per_primary, 3)
+  ).amax(dim=2)
+  positive_link_coverage = (
+    (primary_positive > 0.0).float().sum(dim=1) / float(links_per_side)
+  ).clamp(max=1.0)
+  negative_link_coverage = (
+    (primary_negative > 0.0).float().sum(dim=1) / float(links_per_side)
+  ).clamp(max=1.0)
+  positive_face_quality = positive_slot_coverage * positive_link_coverage
+  negative_face_quality = negative_slot_coverage * negative_link_coverage
+  paired_face_area = torch.minimum(
+    positive_face_quality, negative_face_quality
+  ).amax(dim=1)
+
+  normal_force = torch.abs(torch.sum(force_object * normal_object, dim=-1))
+  tangential_force = torch.sqrt(
+    (torch.square(force_magnitude) - torch.square(normal_force)).clamp(min=0.0)
+  )
+  friction_capacity = friction_coefficient * normal_force
+  friction_margin = (
+    (friction_capacity - tangential_force)
+    / friction_capacity.clamp_min(1.0e-6)
+  ).clamp(min=0.0, max=1.0)
+  normal_strength = (
+    normal_force / max(minimum_force * 4.0, 1.0e-6)
+  ).clamp(max=1.0)
+  force_quality = slot_quality * friction_margin * normal_strength
+  positive_capacity = (
+    force_quality[..., None] * positive_alignment
+  ).sum(dim=1) / float(contacts_per_side)
+  negative_capacity = (
+    force_quality[..., None] * negative_alignment
+  ).sum(dim=1) / float(contacts_per_side)
+  positive_capacity = positive_capacity.clamp(max=1.0)
+  negative_capacity = negative_capacity.clamp(max=1.0)
+  capacity_pair = torch.minimum(positive_capacity, negative_capacity)
+  force_balance = 1.0 - torch.abs(positive_capacity - negative_capacity) / (
+    positive_capacity + negative_capacity
+  ).clamp_min(1.0e-6)
+  task_wrench_quality = (capacity_pair * force_balance).amax(dim=1)
+  grasp_quality = (
+    2.0 * paired_face_area * task_wrench_quality
+    / (paired_face_area + task_wrench_quality).clamp_min(1.0e-6)
+  )
+  return paired_face_area, task_wrench_quality, grasp_quality
+
+
 def _contact_face_metrics(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -124,15 +259,17 @@ def _contact_face_metrics(
   minimum_force: float,
   contacts_for_full_area: int,
   links_for_full_area: int,
+  friction_coefficient: float = 1.5,
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Estimate rigid-contact face coverage, force closure, and persistence.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Estimate paired face coverage, task-wrench quality, and persistence.
 
   MuJoCo exposes contact points rather than a compliant contact patch area.  For
   a cube, the proxy rewards force-bearing contact slots whose normals align with
-  a principal object face and whose points lie away from face edges.  Coverage
-  across distinct gripper links approximates contact area; balanced forces on
-  opposite object faces approximate force closure.
+  a principal object face and whose points lie away from face edges.  A valid
+  face score must cover *both* sides of one principal axis, so pressing several
+  links against one face cannot earn a grasp reward.  The task-wrench score also
+  requires balanced opposing forces with positive friction-cone safety margin.
   """
   cache_key = (
     env.common_step_counter,
@@ -141,6 +278,7 @@ def _contact_face_metrics(
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
+    friction_coefficient,
     object_cfg.name,
   )
   cached = getattr(env, "_talos_face_contact_metrics_cache", None)
@@ -210,19 +348,26 @@ def _contact_face_metrics(
   ).clamp(max=1.0)
   area_proxy = slot_coverage * link_coverage
 
-  force_quality = (
-    active.float()
-    * face_alignment
-    * interior_margin
-    * (force_magnitude / max(minimum_force * 4.0, 1.0e-6)).clamp(max=1.0)
+  # Approximate the task-oriented tactile delta metric using measured force
+  # margins to the Coulomb friction cone.  The pure helper is unit-tested with
+  # one-sided, antipodal, and sliding contact configurations.
+  force_object = quat_apply_inverse(
+    object_quat.reshape(-1, 4), data.force.reshape(-1, 3)
+  ).reshape(batch_size, contact_slots, 3)
+  paired_face_area, task_wrench_quality, grasp_quality = (
+    _paired_face_and_wrench_quality(
+      slot_quality,
+      normal_object,
+      force_object,
+      force_magnitude,
+      primary_count,
+      slots_per_primary,
+      contacts_for_full_area,
+      links_for_full_area,
+      minimum_force,
+      friction_coefficient,
+    )
   )
-  positive_side = (
-    force_quality[..., None] * normal_object.clamp(min=0.0)
-  ).amax(dim=1)
-  negative_side = (
-    force_quality[..., None] * (-normal_object).clamp(min=0.0)
-  ).amax(dim=1)
-  force_closure = torch.minimum(positive_side, negative_side).amax(dim=1)
 
   if data.current_contact_time is None:
     persistence = torch.ones(batch_size, device=env.device)
@@ -233,9 +378,12 @@ def _contact_face_metrics(
     persistence = persistent_links.amin(dim=1)
 
   env.extras["log"]["Metrics/face_contact_area_proxy"] = area_proxy.mean()
-  env.extras["log"]["Metrics/force_closure"] = force_closure.mean()
+  env.extras["log"]["Metrics/paired_face_area"] = paired_face_area.mean()
+  env.extras["log"]["Metrics/force_closure"] = task_wrench_quality.mean()
+  env.extras["log"]["Metrics/task_wrench_quality"] = task_wrench_quality.mean()
+  env.extras["log"]["Metrics/verified_grasp_quality"] = grasp_quality.mean()
   env.extras["log"]["Metrics/grasp_contact_persistence_s"] = persistence.mean()
-  metrics = (area_proxy, force_closure, persistence)
+  metrics = (paired_face_area, task_wrench_quality, grasp_quality, persistence)
   env._talos_face_contact_metrics_cache = (cache_key, metrics)
   return metrics
 
@@ -250,14 +398,14 @@ def gripper_face_contact_area(
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
   """Reward broad force-bearing contacts in the interior of object faces."""
-  area, _, _ = _contact_face_metrics(
+  area, _, _, _ = _contact_face_metrics(
     env,
     sensor_name,
     object_half_extents,
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
-    object_cfg,
+    object_cfg=object_cfg,
   )
   return area
 
@@ -272,14 +420,14 @@ def gripper_force_closure(
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
   """Reward balanced force-bearing contacts on opposite object faces."""
-  _, closure, _ = _contact_face_metrics(
+  _, closure, _, _ = _contact_face_metrics(
     env,
     sensor_name,
     object_half_extents,
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
-    object_cfg,
+    object_cfg=object_cfg,
   )
   return closure
 
@@ -297,14 +445,14 @@ def stable_face_grasp_success(
   object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
 ) -> torch.Tensor:
   """Sparse success for a persistent, broad, force-closure grasp."""
-  area, closure, persistence = _contact_face_metrics(
+  area, closure, _, persistence = _contact_face_metrics(
     env,
     sensor_name,
     object_half_extents,
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
-    object_cfg,
+    object_cfg=object_cfg,
   )
   success = (
     (area >= minimum_area)
@@ -313,6 +461,116 @@ def stable_face_grasp_success(
   )
   env.extras["log"]["Metrics/face_grasp_success"] = success.float().mean()
   return success.float()
+
+
+class grasp_quality_record_progress:
+  """Reward only record improvements in verified grasp quality.
+
+  Unlike additive contact rewards, this term cannot be farmed by maintaining a
+  static touch.  Paired face placement and task-wrench quality must improve in
+  the same episode for additional reward to be produced.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self._best = torch.zeros(env.num_envs, device=env.device)
+    self._initialized = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    object_half_extents: tuple[float, float, float] | None = None,
+    minimum_force: float = 0.25,
+    contacts_for_full_area: int = 6,
+    links_for_full_area: int = 3,
+    friction_coefficient: float = 1.5,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    _, _, quality, _ = _contact_face_metrics(
+      env,
+      sensor_name,
+      object_half_extents,
+      minimum_force,
+      contacts_for_full_area,
+      links_for_full_area,
+      friction_coefficient,
+      object_cfg,
+    )
+    improvement = torch.where(
+      self._initialized,
+      (quality - self._best).clamp(min=0.0),
+      torch.zeros_like(quality),
+    )
+    self._best = torch.where(
+      self._initialized, torch.maximum(self._best, quality), quality
+    )
+    self._initialized[:] = True
+    env.extras["log"]["Metrics/grasp_quality_record"] = self._best.mean()
+    env.extras["log"]["Metrics/grasp_quality_record_improvement"] = (
+      improvement.mean()
+    )
+    return improvement / env.step_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._best[env_ids] = 0.0
+    self._initialized[env_ids] = False
+
+
+class sustained_grasp_ready_success:
+  """Emit one success pulse after holding a physical grasp-quality threshold."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._required_steps = max(
+      1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
+    )
+    self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._emitted = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    required_duration_s: float,
+    minimum_grasp_quality: float,
+    object_half_extents: tuple[float, float, float] | None = None,
+    minimum_force: float = 0.25,
+    contacts_for_full_area: int = 6,
+    links_for_full_area: int = 3,
+    friction_coefficient: float = 1.5,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    del required_duration_s
+    _, _, quality, _ = _contact_face_metrics(
+      env,
+      sensor_name,
+      object_half_extents,
+      minimum_force,
+      contacts_for_full_area,
+      links_for_full_area,
+      friction_coefficient,
+      object_cfg,
+    )
+    valid = quality >= minimum_grasp_quality
+    self._counter = torch.where(valid, self._counter + 1, 0)
+    success = self._counter >= self._required_steps
+    pulse = success & ~self._emitted
+    self._emitted |= success
+    env.extras["log"]["Metrics/grasp_ready_valid"] = valid.float().mean()
+    env.extras["log"]["Metrics/grasp_ready_success"] = success.float().mean()
+    return pulse.float() / env.step_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._counter[env_ids] = 0
+    self._emitted[env_ids] = False
 
 
 def _object_lift_state(
@@ -369,14 +627,14 @@ def object_lift_progress(
     clearance_margin,
   )
   progress = (effective_lift / target_lift_height).clamp(max=1.0).pow(exponent)
-  area, closure, persistence = _contact_face_metrics(
+  area, closure, _, persistence = _contact_face_metrics(
     env,
     sensor_name,
     object_half_extents,
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
-    object_cfg,
+    object_cfg=object_cfg,
   )
   duration_gate = (persistence / minimum_grasp_duration_s).clamp(max=1.0)
   grasp_gate = torch.sqrt((area * closure).clamp(min=0.0)) * duration_gate
@@ -386,6 +644,230 @@ def object_lift_progress(
   env.extras["log"]["Metrics/object_effective_lift_m"] = effective_lift.mean()
   env.extras["log"]["Metrics/stable_grasp_gate"] = grasp_gate.mean()
   return progress * grasp_gate
+
+
+class object_lift_record_progress:
+  """Reward new, grasp-verified airborne-height records only."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg
+    self._best = torch.zeros(env.num_envs, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    initial_center_height: float,
+    table_height: float,
+    target_lift_height: float,
+    sensor_name: str,
+    object_half_extents: tuple[float, float, float] | None = None,
+    sphere_radius: float | None = None,
+    clearance_margin: float = 0.002,
+    minimum_grasp_quality: float = 0.10,
+    minimum_force: float = 0.25,
+    contacts_for_full_area: int = 6,
+    links_for_full_area: int = 3,
+    friction_coefficient: float = 1.5,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    obj: Entity = env.scene[object_cfg.name]
+    center_lift, clearance, effective_lift = _object_lift_state(
+      obj,
+      initial_center_height,
+      table_height,
+      object_half_extents,
+      sphere_radius,
+      clearance_margin,
+    )
+    progress = (effective_lift / target_lift_height).clamp(max=1.0)
+    _, _, grasp_quality, _ = _contact_face_metrics(
+      env,
+      sensor_name,
+      object_half_extents,
+      minimum_force,
+      contacts_for_full_area,
+      links_for_full_area,
+      friction_coefficient,
+      object_cfg,
+    )
+    quality_gate = (grasp_quality / minimum_grasp_quality).clamp(0.0, 1.0)
+    verified_progress = progress * quality_gate
+    improvement = (verified_progress - self._best).clamp(min=0.0)
+    self._best = torch.maximum(self._best, verified_progress)
+    env.extras["log"]["Metrics/object_com_lift_height_m"] = center_lift.mean()
+    env.extras["log"]["Metrics/object_bottom_clearance_m"] = clearance.mean()
+    env.extras["log"]["Metrics/verified_lift_progress"] = verified_progress.mean()
+    env.extras["log"]["Metrics/lift_progress_record"] = self._best.mean()
+    return improvement / env.step_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._best[env_ids] = 0.0
+
+
+class sustained_verified_pick_success:
+  """One-shot pick success after a grasped object is lifted and held.
+
+  Success requires paired-face task-wrench quality, true bottom clearance, low
+  object speed, and low hand-object relative speed for a continuous window.
+  This rejects touch-only policies, transient ballistic launches, and brittle
+  grasps which lose the object during the hold test.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    self._required_steps = max(
+      1, math.ceil(cfg.params["required_duration_s"] / env.step_dt)
+    )
+    self._counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._emitted = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+    self._previous_relative_position = torch.zeros(
+      (env.num_envs, 3), device=env.device
+    )
+    self._initialized = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    site_name: str,
+    initial_center_height: float,
+    table_height: float,
+    minimum_lift_height: float,
+    required_duration_s: float,
+    minimum_grasp_quality: float,
+    maximum_relative_speed: float,
+    maximum_object_speed: float,
+    metric_prefix: str,
+    object_half_extents: tuple[float, float, float] | None = None,
+    sphere_radius: float | None = None,
+    clearance_margin: float = 0.002,
+    minimum_force: float = 0.25,
+    contacts_for_full_area: int = 6,
+    links_for_full_area: int = 3,
+    friction_coefficient: float = 1.5,
+    robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+  ) -> torch.Tensor:
+    del required_duration_s
+    robot: Entity = env.scene[robot_cfg.name]
+    obj: Entity = env.scene[object_cfg.name]
+    _, _, effective_lift = _object_lift_state(
+      obj,
+      initial_center_height,
+      table_height,
+      object_half_extents,
+      sphere_radius,
+      clearance_margin,
+    )
+    _, _, grasp_quality, _ = _contact_face_metrics(
+      env,
+      sensor_name,
+      object_half_extents,
+      minimum_force,
+      contacts_for_full_area,
+      links_for_full_area,
+      friction_coefficient,
+      object_cfg,
+    )
+    site_id = robot.site_names.index(site_name)
+    relative_position = obj.data.root_link_pos_w - robot.data.site_pos_w[:, site_id]
+    relative_speed = torch.linalg.vector_norm(
+      relative_position - self._previous_relative_position, dim=1
+    ) / env.step_dt
+    relative_speed = torch.where(
+      self._initialized, relative_speed, torch.zeros_like(relative_speed)
+    )
+    self._previous_relative_position.copy_(relative_position)
+    self._initialized[:] = True
+    object_speed = torch.linalg.vector_norm(
+      obj.data.root_link_vel_w[:, :3], dim=1
+    )
+    valid = (
+      (effective_lift >= minimum_lift_height)
+      & (grasp_quality >= minimum_grasp_quality)
+      & (relative_speed <= maximum_relative_speed)
+      & (object_speed <= maximum_object_speed)
+    )
+    self._counter = torch.where(valid, self._counter + 1, 0)
+    success = self._counter >= self._required_steps
+    pulse = success & ~self._emitted
+    self._emitted |= success
+    env.extras["log"][f"Metrics/{metric_prefix}_valid"] = valid.float().mean()
+    env.extras["log"][f"Metrics/{metric_prefix}_success"] = success.float().mean()
+    env.extras["log"]["Metrics/object_hand_relative_speed_mps"] = (
+      relative_speed.mean()
+    )
+    env.extras["log"]["Metrics/object_linear_speed_mps"] = object_speed.mean()
+    return pulse.float() / env.step_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._counter[env_ids] = 0
+    self._emitted[env_ids] = False
+    self._previous_relative_position[env_ids] = 0.0
+    self._initialized[env_ids] = False
+
+
+def gripper_reopening_during_contact(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Penalize opening the coupled gripper while it is touching the object."""
+  sensor = env.scene[sensor_name]
+  if not isinstance(sensor, ContactSensor) or sensor.data.found is None:
+    raise TypeError(f"'{sensor_name}' must provide ContactSensor found data.")
+  robot: Entity = env.scene[asset_cfg.name]
+  touching = (sensor.data.found > 0).any(dim=1)
+  reopening_speed = robot.data.joint_vel[:, asset_cfg.joint_ids].clamp(min=0.0)
+  penalty = torch.square(reopening_speed).sum(dim=1) * touching.float()
+  env.extras["log"]["Metrics/gripper_reopening_contact"] = penalty.mean()
+  return penalty
+
+
+def object_launch_velocity(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  initial_center_height: float,
+  maximum_upward_speed: float,
+  minimum_center_lift: float = 0.005,
+  object_half_extents: tuple[float, float, float] | None = None,
+  minimum_force: float = 0.25,
+  contacts_for_full_area: int = 6,
+  links_for_full_area: int = 3,
+  friction_coefficient: float = 1.5,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Penalize upward ballistic motion not supported by a verified grasp."""
+  obj: Entity = env.scene[object_cfg.name]
+  _, _, grasp_quality, _ = _contact_face_metrics(
+    env,
+    sensor_name,
+    object_half_extents,
+    minimum_force,
+    contacts_for_full_area,
+    links_for_full_area,
+    friction_coefficient,
+    object_cfg,
+  )
+  center_lift = obj.data.root_link_pos_w[:, 2] - initial_center_height
+  upward_excess = (
+    obj.data.root_link_vel_w[:, 2] - maximum_upward_speed
+  ).clamp(min=0.0)
+  airborne = center_lift >= minimum_center_lift
+  penalty = (
+    torch.square(upward_excess / maximum_upward_speed)
+    * (1.0 - grasp_quality)
+    * airborne.float()
+  )
+  env.extras["log"]["Metrics/object_launch_penalty"] = penalty.mean()
+  return penalty
 
 
 def excessive_object_lift_height(
@@ -435,14 +917,14 @@ def grasp_and_lift_success(
     sphere_radius,
     clearance_margin,
   )
-  area, closure, persistence = _contact_face_metrics(
+  area, closure, _, persistence = _contact_face_metrics(
     env,
     sensor_name,
     object_half_extents,
     minimum_force,
     contacts_for_full_area,
     links_for_full_area,
-    object_cfg,
+    object_cfg=object_cfg,
   )
   high_enough = effective_lift >= minimum_lift_height
   stable_grasp = (

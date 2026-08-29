@@ -680,6 +680,9 @@ def talos_tabletop_grasp_env_cfg(
   )
   left_arm = SceneEntityCfg("robot", joint_names=(r"arm_left_.*_joint",))
   right_arm = SceneEntityCfg("robot", joint_names=(r"arm_right_.*_joint",))
+  right_gripper_joint = SceneEntityCfg(
+    "robot", joint_names=(r"gripper_right_joint",)
+  )
   cfg.rewards = {
     "upright": RewardTermCfg(
       func=mdp.upright,
@@ -859,6 +862,11 @@ def talos_tabletop_grasp_env_cfg(
       weight=0.0,
       params={"site_name": "right_grasp_center", "std": 0.15},
     ),
+    "approach_progress": RewardTermCfg(
+      func=mdp.site_object_record_progress,
+      weight=0.0,
+      params={"site_name": "right_grasp_center", "std": 0.15},
+    ),
     "multi_link_contact": RewardTermCfg(
       func=mdp.gripper_object_contact,
       weight=0.0,
@@ -883,6 +891,14 @@ def talos_tabletop_grasp_env_cfg(
         "object_half_extents": object_half_extents,
       },
     ),
+    "grasp_quality_progress": RewardTermCfg(
+      func=mdp.grasp_quality_record_progress,
+      weight=0.0,
+      params={
+        "sensor_name": right_contact.name,
+        "object_half_extents": object_half_extents,
+      },
+    ),
     "face_grasp_success": RewardTermCfg(
       func=mdp.stable_face_grasp_success,
       weight=0.0,
@@ -891,8 +907,18 @@ def talos_tabletop_grasp_env_cfg(
         "object_half_extents": object_half_extents,
       },
     ),
+    "grasp_ready_success": RewardTermCfg(
+      func=mdp.sustained_grasp_ready_success,
+      weight=0.0,
+      params={
+        "sensor_name": right_contact.name,
+        "object_half_extents": object_half_extents,
+        "required_duration_s": 0.25,
+        "minimum_grasp_quality": 0.20,
+      },
+    ),
     "lift_progress": RewardTermCfg(
-      func=mdp.object_lift_progress,
+      func=mdp.object_lift_record_progress,
       weight=0.0,
       params={
         "initial_center_height": initial_center_height,
@@ -901,34 +927,64 @@ def talos_tabletop_grasp_env_cfg(
         "sensor_name": right_contact.name,
         "object_half_extents": object_half_extents,
         "sphere_radius": sphere_radius,
+        "minimum_grasp_quality": 0.10,
       },
     ),
     "low_lift_success": RewardTermCfg(
-      func=mdp.grasp_and_lift_success,
+      func=mdp.sustained_verified_pick_success,
       weight=0.0,
       params={
         "sensor_name": right_contact.name,
+        "site_name": "right_grasp_center",
         "initial_center_height": initial_center_height,
         "table_height": TABLE_TOP_HEIGHT_M,
         "minimum_lift_height": 0.02,
-        "minimum_contacts": 2,
+        "required_duration_s": 0.50,
+        "minimum_grasp_quality": 0.15,
+        "maximum_relative_speed": 0.08,
+        "maximum_object_speed": 0.12,
+        "metric_prefix": "micro_pick",
         "object_half_extents": object_half_extents,
         "sphere_radius": sphere_radius,
       },
     ),
     "grasp_lift_success": RewardTermCfg(
-      func=mdp.grasp_and_lift_success,
+      func=mdp.sustained_verified_pick_success,
       weight=0.0,
       params={
         "sensor_name": right_contact.name,
+        "site_name": "right_grasp_center",
         "initial_center_height": initial_center_height,
         "table_height": TABLE_TOP_HEIGHT_M,
         "minimum_lift_height": 0.08,
-        "minimum_contacts": 2,
+        "required_duration_s": 1.0,
+        "minimum_grasp_quality": 0.15,
+        "maximum_relative_speed": 0.05,
+        "maximum_object_speed": 0.10,
+        "metric_prefix": "verified_pick",
         "object_half_extents": object_half_extents,
         "sphere_radius": sphere_radius,
       },
     ),
+    "gripper_reopening": RewardTermCfg(
+      func=mdp.gripper_reopening_during_contact,
+      weight=0.0,
+      params={
+        "sensor_name": right_contact.name,
+        "asset_cfg": right_gripper_joint,
+      },
+    ),
+    "object_launch": RewardTermCfg(
+      func=mdp.object_launch_velocity,
+      weight=0.0,
+      params={
+        "sensor_name": right_contact.name,
+        "initial_center_height": initial_center_height,
+        "maximum_upward_speed": 0.25,
+        "object_half_extents": object_half_extents,
+      },
+    ),
+    "task_time": RewardTermCfg(func=mdp.task_time, weight=0.0),
     "excessive_object_height": RewardTermCfg(
       func=mdp.excessive_object_lift_height,
       weight=0.0,
@@ -1258,10 +1314,10 @@ def talos_tabletop_stationary_grasp_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
   """Train a stationary manipulation policy without navigation or placement.
 
-  Stage 0 removes the table and object from the physical scene and masks their
-  observations while the robot learns to stand still.  Stage 1 restores the
-  tabletop scene and trains right-hand approach, multi-link contact, and lift.
-  It is the terminal stage: object transport and placement stay disabled.
+  Stage 0 removes the table and object while the robot learns to stand still.
+  Stage 1 restores the scene and learns a paired-face, wrench-stable grasp.
+  Stage 2 requires a verified 2 cm micro-pick and hold test.  Stage 3 performs
+  the full 8--10 cm pick.  Transport and placement remain disabled.
   """
   cfg = talos_tabletop_grasp_env_cfg(
     object_shape=object_shape,
@@ -1337,41 +1393,37 @@ def talos_tabletop_stationary_grasp_env_cfg(
     "right_arm_pose": -0.05,
     "excessive_object_height": -10.0,
   }
-  approach_weights = {
+  grasp_acquisition_weights = {
     **manipulation_balance_weights,
-    "approach_object": 4.0,
-    "multi_link_contact": 1.0,
-    "face_contact_area": 0.5,
-    "force_closure": 0.5,
+    "approach_progress": 4.0,
+    "grasp_quality_progress": 12.0,
+    "grasp_ready_success": 25.0,
+    "gripper_reopening": -1.0,
+    "object_launch": -5.0,
+    "task_time": -0.02,
   }
-  face_grasp_weights = {
+  micro_pick_weights = {
     **manipulation_balance_weights,
-    "approach_object": 2.0,
-    "multi_link_contact": 0.5,
-    "face_contact_area": 5.0,
-    "force_closure": 5.0,
-    "face_grasp_success": 10.0,
+    "approach_progress": 1.0,
+    "grasp_quality_progress": 8.0,
+    "grasp_ready_success": 2.0,
+    "lift_progress": 30.0,
+    "low_lift_success": 50.0,
+    "gripper_reopening": -1.0,
+    "object_launch": -10.0,
+    "task_time": -0.02,
   }
-  low_lift_weights = {
+  full_pick_weights = {
     **manipulation_balance_weights,
-    "approach_object": 1.0,
-    "multi_link_contact": 0.25,
-    "face_contact_area": 3.0,
-    "force_closure": 5.0,
-    "face_grasp_success": 2.0,
-    "lift_progress": 15.0,
-    "low_lift_success": 12.0,
-  }
-  full_lift_weights = {
-    **manipulation_balance_weights,
-    "approach_object": 0.5,
-    "multi_link_contact": 0.1,
-    "face_contact_area": 2.0,
-    "force_closure": 4.0,
-    "face_grasp_success": 1.0,
-    "lift_progress": 25.0,
-    "low_lift_success": 3.0,
-    "grasp_lift_success": 20.0,
+    "approach_progress": 0.5,
+    "grasp_quality_progress": 5.0,
+    "grasp_ready_success": 1.0,
+    "lift_progress": 50.0,
+    "low_lift_success": 2.0,
+    "grasp_lift_success": 80.0,
+    "gripper_reopening": -1.0,
+    "object_launch": -15.0,
+    "task_time": -0.02,
     "excessive_object_height": -20.0,
   }
   for reward_name, weight in standing_weights.items():
@@ -1393,27 +1445,20 @@ def talos_tabletop_stationary_grasp_env_cfg(
       params={
         "stage_reward_weights": (
           standing_weights,
-          approach_weights,
-          face_grasp_weights,
-          low_lift_weights,
-          full_lift_weights,
+          grasp_acquisition_weights,
+          micro_pick_weights,
+          full_pick_weights,
         ),
         "promotion_reward_names": (
           "standing_success",
-          "multi_link_contact",
-          "face_grasp_success",
+          "grasp_ready_success",
           "low_lift_success",
         ),
-        "promotion_success_rates": (0.80, 0.70, 0.60, 0.50),
-        "evaluation_episodes": (4096, 4096, 4096, 4096),
+        "promotion_success_rates": (0.80, 0.45, 0.40),
+        "evaluation_episodes": (4096, 4096, 4096),
         "initial_stage": 0,
         "stage_termination_params": (
           {"object_lost": {"minimum_height": -100.0}},
-          {
-            "object_lost": {
-              "minimum_height": TABLE_TOP_HEIGHT_M - 0.12,
-            }
-          },
           {
             "object_lost": {
               "minimum_height": TABLE_TOP_HEIGHT_M - 0.12,
@@ -1434,12 +1479,6 @@ def talos_tabletop_stationary_grasp_env_cfg(
           {
             "reset_table_root": {"pose_range": hidden_pose_range},
             "reset_object_on_pickup_zone": {"pose_range": hidden_pose_range},
-          },
-          {
-            "reset_table_root": {"pose_range": {}},
-            "reset_object_on_pickup_zone": {
-              "pose_range": active_object_pose_range
-            },
           },
           {
             "reset_table_root": {"pose_range": {}},
