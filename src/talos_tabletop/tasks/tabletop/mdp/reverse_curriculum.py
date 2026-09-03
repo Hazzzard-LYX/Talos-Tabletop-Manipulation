@@ -1,244 +1,224 @@
-"""Stage definitions for the grasping reverse curriculum.
+"""Task-state classifier for the grasping reverse curriculum.
 
-The curriculum deliberately keeps two stage labels separate:
-
-* ``reset_stage`` describes how a sampled initial state was generated.  It may
-  include uncontrollable context such as object mass and friction.
-* ``progress_stage`` describes only action-reducible grasp error.  It is used
-  later for milestone rewards and rollout-state banking.
-
-Stage zero is reserved for a verified grasp.  Stages 1--20 are ordered from
-easiest to hardest.
+This first classifier partitions robot states, not perturbation sources or raw
+joint coordinates. Every physically valid standing state maps to Stage 1--20,
+while Stage 0 is reserved for a verified, dynamically stable grasp. The
+initial analytic limits and equal-width boundaries are deliberately exposed so
+rollout success data can calibrate them later.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 
-PerturbationFocus = Literal[
-  "gripper_opening",
-  "axial_retreat",
+GRASP_DIFFICULTY_COMPONENT_NAMES = (
+  "axial_position",
   "lateral_position",
   "wrist_rotation",
-  "arm_torso_joints",
-  "base_state",
-  "object_geometry",
-  "object_dynamics",
-]
+  "gripper_opening",
+  "joint_limit_risk",
+  "base_tilt",
+  "base_linear_speed",
+  "base_angular_speed",
+  "hand_object_relative_speed",
+)
+
+# Nineteen boundaries create twenty closed, ordered difficulty regions. They
+# are an initialization only; later evaluation will replace them with values
+# calibrated against empirical finite-horizon grasp success probability.
+DEFAULT_GRASP_STAGE_BOUNDARIES = tuple(index / 20.0 for index in range(1, 20))
 
 
 @dataclass(frozen=True)
-class ReverseCurriculumStageSpec:
-  """Cumulative reset-distribution limits for one curriculum stage."""
+class GraspStateFeatures:
+  """Task-relevant coordinates for a batch of valid standing states.
 
-  stage: int
-  focus: PerturbationFocus
-  level_in_focus: int
-  max_gripper_opening_delta_rad: float = 0.0
-  max_axial_retreat_m: float = 0.0
-  max_lateral_position_error_m: float = 0.0
-  max_wrist_rotation_error_rad: float = 0.0
-  max_arm_torso_joint_error_rad: float = 0.0
-  max_base_tilt_error_rad: float = 0.0
-  max_base_linear_speed_mps: float = 0.0
-  max_base_angular_speed_rad_s: float = 0.0
-  max_object_xy_error_m: float = 0.0
-  max_object_yaw_error_rad: float = 0.0
-  object_size_scale_range: tuple[float, float] = (1.0, 1.0)
-  object_mass_scale_range: tuple[float, float] = (1.0, 1.0)
-  object_friction_scale_range: tuple[float, float] = (1.0, 1.0)
-
-
-def _build_reverse_curriculum_stages() -> tuple[ReverseCurriculumStageSpec, ...]:
-  cumulative: dict[str, float | tuple[float, float]] = {}
-  schedule: tuple[
-    tuple[int, PerturbationFocus, int, dict[str, float | tuple[float, float]]],
-    ...,
-  ] = (
-    # 1--2: open the gripper relative to a successful Stage-0 grasp state.
-    (1, "gripper_opening", 1, {"max_gripper_opening_delta_rad": 0.03}),
-    (2, "gripper_opening", 2, {"max_gripper_opening_delta_rad": 0.08}),
-    # 3--5: move the palm backward along the successful grasp approach axis.
-    (3, "axial_retreat", 1, {"max_axial_retreat_m": 0.015}),
-    (4, "axial_retreat", 2, {"max_axial_retreat_m": 0.040}),
-    (5, "axial_retreat", 3, {"max_axial_retreat_m": 0.080}),
-    # 6--7: introduce error perpendicular to that approach axis.
-    (6, "lateral_position", 1, {"max_lateral_position_error_m": 0.008}),
-    (7, "lateral_position", 2, {"max_lateral_position_error_m": 0.025}),
-    # 8--10: rotate the wrist away from its successful object-relative pose.
-    (8, "wrist_rotation", 1, {"max_wrist_rotation_error_rad": math.radians(5)}),
-    (9, "wrist_rotation", 2, {"max_wrist_rotation_error_rad": math.radians(12)}),
-    (10, "wrist_rotation", 3, {"max_wrist_rotation_error_rad": math.radians(25)}),
-    # 11--12: disturb shoulder, elbow, and torso joints before solving/settling.
-    (11, "arm_torso_joints", 1, {"max_arm_torso_joint_error_rad": 0.025}),
-    (12, "arm_torso_joints", 2, {"max_arm_torso_joint_error_rad": 0.075}),
-    # 13--14: disturb the floating-base attitude and initial velocity.
-    (
-      13,
-      "base_state",
-      1,
-      {
-        "max_base_tilt_error_rad": math.radians(2),
-        "max_base_linear_speed_mps": 0.03,
-        "max_base_angular_speed_rad_s": 0.08,
-      },
-    ),
-    (
-      14,
-      "base_state",
-      2,
-      {
-        "max_base_tilt_error_rad": math.radians(6),
-        "max_base_linear_speed_mps": 0.10,
-        "max_base_angular_speed_rad_s": 0.25,
-      },
-    ),
-    # 15--17: randomize the cube pose and dimensions.
-    (
-      15,
-      "object_geometry",
-      1,
-      {
-        "max_object_xy_error_m": 0.015,
-        "max_object_yaw_error_rad": math.radians(10),
-        "object_size_scale_range": (0.95, 1.05),
-      },
-    ),
-    (
-      16,
-      "object_geometry",
-      2,
-      {
-        "max_object_xy_error_m": 0.040,
-        "max_object_yaw_error_rad": math.radians(45),
-        "object_size_scale_range": (0.90, 1.10),
-      },
-    ),
-    (
-      17,
-      "object_geometry",
-      3,
-      {
-        "max_object_xy_error_m": 0.080,
-        "max_object_yaw_error_rad": math.pi,
-        "object_size_scale_range": (0.80, 1.20),
-      },
-    ),
-    # 18--20: widen object mass and contact-friction distributions.
-    (
-      18,
-      "object_dynamics",
-      1,
-      {
-        "object_mass_scale_range": (0.75, 1.25),
-        "object_friction_scale_range": (0.85, 1.15),
-      },
-    ),
-    (
-      19,
-      "object_dynamics",
-      2,
-      {
-        "object_mass_scale_range": (0.50, 1.50),
-        "object_friction_scale_range": (0.65, 1.35),
-      },
-    ),
-    (
-      20,
-      "object_dynamics",
-      3,
-      {
-        "object_mass_scale_range": (0.25, 2.00),
-        "object_friction_scale_range": (0.50, 1.50),
-      },
-    ),
-  )
-
-  stages: list[ReverseCurriculumStageSpec] = []
-  for stage, focus, level, updates in schedule:
-    cumulative.update(updates)
-    stages.append(
-      ReverseCurriculumStageSpec(
-        stage=stage,
-        focus=focus,
-        level_in_focus=level,
-        **cumulative,
-      )
-    )
-  return tuple(stages)
-
-
-REVERSE_CURRICULUM_STAGES = _build_reverse_curriculum_stages()
-
-
-def get_reverse_curriculum_stage(stage: int) -> ReverseCurriculumStageSpec:
-  """Return the immutable reset specification for Stage 1--20."""
-  if not 1 <= stage <= len(REVERSE_CURRICULUM_STAGES):
-    raise ValueError("Reverse-curriculum stage must be in [1, 20].")
-  return REVERSE_CURRICULUM_STAGES[stage - 1]
-
-
-@dataclass(frozen=True)
-class GraspProgressStageLimits:
-  """Errors that saturate the controllable progress classifier at Stage 20."""
-
-  gripper_opening_delta_rad: float = 0.10
-  axial_position_error_m: float = 0.20
-  lateral_position_error_m: float = 0.10
-  wrist_rotation_error_rad: float = math.pi / 2.0
-
-
-DEFAULT_GRASP_PROGRESS_LIMITS = GraspProgressStageLimits()
-
-
-def classify_grasp_progress_stage(
-  gripper_opening_delta_rad: torch.Tensor,
-  axial_position_error_m: torch.Tensor,
-  lateral_position_error_m: torch.Tensor,
-  wrist_rotation_error_rad: torch.Tensor,
-  grasp_formed: torch.Tensor,
-  limits: GraspProgressStageLimits = DEFAULT_GRASP_PROGRESS_LIMITS,
-) -> torch.Tensor:
-  """Map every action-reducible grasp state to integer Stage 0--20.
-
-  Stage 0 means that the caller's verified-grasp predicate is true.  Otherwise
-  each normalized error is split into twenty equal intervals, and the worst
-  component selects the stage.  This max-norm construction prevents a small
-  error on one axis from compensating for a dangerous error on another.
-
-  Mass, friction, object size, and reset-time disturbances are intentionally
-  absent: the policy cannot reduce those values through action.  They belong
-  to ``reset_stage`` and must not block within-episode progress rewards.
+  Position and rotation errors are measured against the desired object-relative
+  grasp frame. ``gripper_open_fraction`` and ``joint_limit_risk`` are already
+  normalized to [0, 1]. The contact count must count distinct hand links, not
+  raw contact points. ``verified_grasp`` is a strict force-closure predicate;
+  the classifier additionally checks motion before allowing Stage 0.
   """
-  limit_values = (
-    limits.gripper_opening_delta_rad,
+
+  axial_position_error_m: torch.Tensor
+  lateral_position_error_m: torch.Tensor
+  wrist_rotation_error_rad: torch.Tensor
+  gripper_open_fraction: torch.Tensor
+  joint_limit_risk: torch.Tensor
+  projected_gravity_xy: torch.Tensor
+  base_linear_speed_mps: torch.Tensor
+  base_angular_speed_rad_s: torch.Tensor
+  hand_object_relative_speed_mps: torch.Tensor
+  contact_link_count: torch.Tensor
+  verified_grasp: torch.Tensor
+
+
+@dataclass(frozen=True)
+class GraspStateDifficultyLimits:
+  """Initial saturation and Stage-0 stability limits for the classifier."""
+
+  axial_position_error_m: float = 0.30
+  lateral_position_error_m: float = 0.20
+  wrist_rotation_error_rad: float = math.pi
+  base_tilt_projected_gravity_xy: float = 0.70
+  base_linear_speed_mps: float = 0.50
+  base_angular_speed_rad_s: float = 1.00
+  hand_object_relative_speed_mps: float = 0.50
+  stage_zero_max_projected_gravity_xy: float = 0.15
+  stage_zero_max_base_linear_speed_mps: float = 0.10
+  stage_zero_max_base_angular_speed_rad_s: float = 0.25
+  stage_zero_max_hand_object_relative_speed_mps: float = 0.08
+
+
+DEFAULT_GRASP_STATE_LIMITS = GraspStateDifficultyLimits()
+
+
+@dataclass(frozen=True)
+class GraspStateClassification:
+  """Classifier output retained for logging and later boundary calibration."""
+
+  stage: torch.Tensor
+  difficulty: torch.Tensor
+  component_difficulties: torch.Tensor
+  dominant_component: torch.Tensor
+  stable_verified_grasp: torch.Tensor
+
+
+def _validate_limits(limits: GraspStateDifficultyLimits) -> None:
+  saturation_limits = (
     limits.axial_position_error_m,
     limits.lateral_position_error_m,
     limits.wrist_rotation_error_rad,
+    limits.base_tilt_projected_gravity_xy,
+    limits.base_linear_speed_mps,
+    limits.base_angular_speed_rad_s,
+    limits.hand_object_relative_speed_mps,
   )
-  if any(value <= 0.0 for value in limit_values):
-    raise ValueError("All grasp-progress limits must be positive.")
+  if any(value <= 0.0 for value in saturation_limits):
+    raise ValueError("All grasp-state saturation limits must be positive.")
 
-  errors = torch.broadcast_tensors(
-    gripper_opening_delta_rad,
-    axial_position_error_m,
-    lateral_position_error_m,
-    wrist_rotation_error_rad,
+
+def _validate_boundaries(boundaries: tuple[float, ...]) -> None:
+  if len(boundaries) != 19:
+    raise ValueError("Exactly 19 boundaries are required for Stage 1--20.")
+  if not all(0.0 < value < 1.0 for value in boundaries):
+    raise ValueError("Stage boundaries must lie strictly inside (0, 1).")
+  if not all(
+    left < right
+    for left, right in zip(boundaries[:-1], boundaries[1:], strict=True)
+  ):
+    raise ValueError("Stage boundaries must be strictly increasing.")
+
+
+def classify_grasp_state(
+  features: GraspStateFeatures,
+  limits: GraspStateDifficultyLimits = DEFAULT_GRASP_STATE_LIMITS,
+  stage_boundaries: tuple[float, ...] = DEFAULT_GRASP_STAGE_BOUNDARIES,
+) -> GraspStateClassification:
+  """Classify every valid standing state into grasp-progress Stage 0--20.
+
+  The worst normalized component controls difficulty, preventing good position
+  on one axis from compensating for a dangerous wrist, balance, or velocity
+  error. Contact state applies a lower stage bound: zero contacts cannot be
+  easier than Stage 3 and one-link contact cannot be easier than Stage 2.
+  A strict grasp reaches Stage 0 only while the hand-object and base motion are
+  inside the dedicated stability limits.
+  """
+  _validate_limits(limits)
+  _validate_boundaries(stage_boundaries)
+
+  values = torch.broadcast_tensors(
+    features.axial_position_error_m,
+    features.lateral_position_error_m,
+    features.wrist_rotation_error_rad,
+    features.gripper_open_fraction,
+    features.joint_limit_risk,
+    features.projected_gravity_xy,
+    features.base_linear_speed_mps,
+    features.base_angular_speed_rad_s,
+    features.hand_object_relative_speed_mps,
+    features.contact_link_count,
+    features.verified_grasp,
   )
-  normalized = torch.stack(
-    tuple(
-      torch.abs(error) / limit
-      for error, limit in zip(errors, limit_values, strict=True)
+  (
+    axial_error,
+    lateral_error,
+    wrist_error,
+    gripper_open_fraction,
+    joint_limit_risk,
+    projected_gravity_xy,
+    base_linear_speed,
+    base_angular_speed,
+    relative_speed,
+    contact_link_count,
+    verified_grasp,
+  ) = values
+
+  components = torch.stack(
+    (
+      torch.abs(axial_error) / limits.axial_position_error_m,
+      torch.abs(lateral_error) / limits.lateral_position_error_m,
+      torch.abs(wrist_error) / limits.wrist_rotation_error_rad,
+      torch.abs(gripper_open_fraction),
+      torch.abs(joint_limit_risk),
+      torch.abs(projected_gravity_xy)
+      / limits.base_tilt_projected_gravity_xy,
+      torch.abs(base_linear_speed) / limits.base_linear_speed_mps,
+      torch.abs(base_angular_speed) / limits.base_angular_speed_rad_s,
+      torch.abs(relative_speed) / limits.hand_object_relative_speed_mps,
     ),
     dim=-1,
+  ).clamp(min=0.0, max=1.0)
+  difficulty, dominant_component = components.max(dim=-1)
+
+  boundaries = torch.tensor(
+    stage_boundaries, device=difficulty.device, dtype=difficulty.dtype
   )
-  difficulty = normalized.amax(dim=-1)
-  stage = torch.ceil(difficulty * 20.0).to(dtype=torch.long).clamp(1, 20)
-  grasp_formed = torch.as_tensor(
-    grasp_formed, device=stage.device, dtype=torch.bool
-  ).expand_as(stage)
-  return torch.where(grasp_formed, torch.zeros_like(stage), stage)
+  stage = (torch.bucketize(difficulty.contiguous(), boundaries) + 1).to(
+    dtype=torch.long
+  )
+
+  contact_link_count = contact_link_count.to(dtype=torch.long)
+  minimum_contact_stage = torch.where(
+    contact_link_count >= 2,
+    torch.ones_like(stage),
+    torch.where(
+      contact_link_count == 1,
+      torch.full_like(stage, 2),
+      torch.full_like(stage, 3),
+    ),
+  )
+  stage = torch.maximum(stage, minimum_contact_stage)
+
+  stable_verified_grasp = (
+    verified_grasp.to(dtype=torch.bool)
+    & (contact_link_count >= 2)
+    & (
+      torch.abs(projected_gravity_xy)
+      <= limits.stage_zero_max_projected_gravity_xy
+    )
+    & (
+      torch.abs(base_linear_speed)
+      <= limits.stage_zero_max_base_linear_speed_mps
+    )
+    & (
+      torch.abs(base_angular_speed)
+      <= limits.stage_zero_max_base_angular_speed_rad_s
+    )
+    & (
+      torch.abs(relative_speed)
+      <= limits.stage_zero_max_hand_object_relative_speed_mps
+    )
+  )
+  stage = torch.where(stable_verified_grasp, torch.zeros_like(stage), stage)
+
+  return GraspStateClassification(
+    stage=stage,
+    difficulty=difficulty,
+    component_difficulties=components,
+    dominant_component=dominant_component,
+    stable_verified_grasp=stable_verified_grasp,
+  )

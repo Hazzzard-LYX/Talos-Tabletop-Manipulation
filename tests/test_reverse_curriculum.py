@@ -3,107 +3,108 @@ import math
 import pytest
 import torch
 from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
-  REVERSE_CURRICULUM_STAGES,
-  classify_grasp_progress_stage,
-  get_reverse_curriculum_stage,
+  GRASP_DIFFICULTY_COMPONENT_NAMES,
+  GraspStateFeatures,
+  classify_grasp_state,
 )
 
 
-def test_reverse_curriculum_defines_all_twenty_ordered_stages() -> None:
-  assert [spec.stage for spec in REVERSE_CURRICULUM_STAGES] == list(range(1, 21))
-  assert [spec.focus for spec in REVERSE_CURRICULUM_STAGES] == [
-    "gripper_opening",
-    "gripper_opening",
-    "axial_retreat",
-    "axial_retreat",
-    "axial_retreat",
-    "lateral_position",
-    "lateral_position",
-    "wrist_rotation",
-    "wrist_rotation",
-    "wrist_rotation",
-    "arm_torso_joints",
-    "arm_torso_joints",
-    "base_state",
-    "base_state",
-    "object_geometry",
-    "object_geometry",
-    "object_geometry",
-    "object_dynamics",
-    "object_dynamics",
-    "object_dynamics",
-  ]
+def _features(batch_size: int, **overrides: torch.Tensor) -> GraspStateFeatures:
+  defaults = {
+    "axial_position_error_m": torch.zeros(batch_size),
+    "lateral_position_error_m": torch.zeros(batch_size),
+    "wrist_rotation_error_rad": torch.zeros(batch_size),
+    "gripper_open_fraction": torch.zeros(batch_size),
+    "joint_limit_risk": torch.zeros(batch_size),
+    "projected_gravity_xy": torch.zeros(batch_size),
+    "base_linear_speed_mps": torch.zeros(batch_size),
+    "base_angular_speed_rad_s": torch.zeros(batch_size),
+    "hand_object_relative_speed_mps": torch.zeros(batch_size),
+    "contact_link_count": torch.full((batch_size,), 2),
+    "verified_grasp": torch.zeros(batch_size, dtype=torch.bool),
+  }
+  defaults.update(overrides)
+  return GraspStateFeatures(**defaults)
 
 
-def test_reset_stage_limits_are_cumulative() -> None:
-  scalar_fields = (
-    "max_gripper_opening_delta_rad",
-    "max_axial_retreat_m",
-    "max_lateral_position_error_m",
-    "max_wrist_rotation_error_rad",
-    "max_arm_torso_joint_error_rad",
-    "max_base_tilt_error_rad",
-    "max_base_linear_speed_mps",
-    "max_base_angular_speed_rad_s",
-    "max_object_xy_error_m",
-    "max_object_yaw_error_rad",
+def test_all_twenty_ungrasped_stages_are_reachable() -> None:
+  normalized = (torch.arange(20, dtype=torch.float) + 0.5) / 20.0
+  result = classify_grasp_state(
+    _features(20, axial_position_error_m=normalized * 0.30)
   )
-  for previous, current in zip(
-    REVERSE_CURRICULUM_STAGES[:-1],
-    REVERSE_CURRICULUM_STAGES[1:],
-    strict=True,
-  ):
-    for field in scalar_fields:
-      assert getattr(current, field) >= getattr(previous, field)
-    for field in (
-      "object_size_scale_range",
-      "object_mass_scale_range",
-      "object_friction_scale_range",
-    ):
-      previous_range = getattr(previous, field)
-      current_range = getattr(current, field)
-      assert current_range[0] <= previous_range[0]
-      assert current_range[1] >= previous_range[1]
+  assert result.stage.tolist() == list(range(1, 21))
 
 
-def test_stage_lookup_rejects_stage_zero_and_out_of_range() -> None:
-  assert get_reverse_curriculum_stage(1) is REVERSE_CURRICULUM_STAGES[0]
-  assert get_reverse_curriculum_stage(20) is REVERSE_CURRICULUM_STAGES[-1]
+def test_verified_stable_grasp_is_stage_zero() -> None:
+  result = classify_grasp_state(
+    _features(
+      1,
+      verified_grasp=torch.tensor([True]),
+      contact_link_count=torch.tensor([3]),
+      hand_object_relative_speed_mps=torch.tensor([0.05]),
+    )
+  )
+  assert result.stage.item() == 0
+  assert result.stable_verified_grasp.item() is True
+
+
+def test_unstable_grasp_does_not_enter_stage_zero() -> None:
+  result = classify_grasp_state(
+    _features(
+      1,
+      verified_grasp=torch.tensor([True]),
+      contact_link_count=torch.tensor([3]),
+      hand_object_relative_speed_mps=torch.tensor([0.20]),
+    )
+  )
+  assert result.stage.item() > 0
+  assert result.stable_verified_grasp.item() is False
+
+
+def test_contact_state_sets_minimum_ungrasped_stage() -> None:
+  result = classify_grasp_state(
+    _features(
+      3,
+      contact_link_count=torch.tensor([2, 1, 0]),
+    )
+  )
+  assert result.stage.tolist() == [1, 2, 3]
+
+
+def test_worst_component_determines_difficulty() -> None:
+  result = classify_grasp_state(
+    _features(
+      1,
+      axial_position_error_m=torch.tensor([0.03]),
+      lateral_position_error_m=torch.tensor([0.02]),
+      wrist_rotation_error_rad=torch.tensor([0.1 * math.pi]),
+      gripper_open_fraction=torch.tensor([0.75]),
+    )
+  )
+  assert result.stage.item() == 15
+  assert result.difficulty.item() == pytest.approx(0.75)
+  assert GRASP_DIFFICULTY_COMPONENT_NAMES[result.dominant_component.item()] == (
+    "gripper_opening"
+  )
+
+
+def test_extreme_valid_state_saturates_at_stage_twenty() -> None:
+  result = classify_grasp_state(
+    _features(1, lateral_position_error_m=torch.tensor([10.0]))
+  )
+  assert result.stage.item() == 20
+  assert result.difficulty.item() == 1.0
+
+
+def test_custom_boundaries_are_supported_for_later_calibration() -> None:
+  boundaries = tuple(0.01 * index for index in range(1, 20))
+  result = classify_grasp_state(
+    _features(1, axial_position_error_m=torch.tensor([0.045])),
+    stage_boundaries=boundaries,
+  )
+  assert result.stage.item() == 15
+
+
+def test_invalid_boundary_count_is_rejected() -> None:
   with pytest.raises(ValueError):
-    get_reverse_curriculum_stage(0)
-  with pytest.raises(ValueError):
-    get_reverse_curriculum_stage(21)
-
-
-def test_progress_classifier_reserves_zero_for_verified_grasp() -> None:
-  stage = classify_grasp_progress_stage(
-    gripper_opening_delta_rad=torch.tensor([10.0]),
-    axial_position_error_m=torch.tensor([10.0]),
-    lateral_position_error_m=torch.tensor([10.0]),
-    wrist_rotation_error_rad=torch.tensor([math.pi]),
-    grasp_formed=torch.tensor([True]),
-  )
-  assert stage.item() == 0
-
-
-def test_progress_classifier_maps_ungrasped_states_to_one_through_twenty() -> None:
-  stage = classify_grasp_progress_stage(
-    gripper_opening_delta_rad=torch.tensor([0.0, 0.025, 0.10, 1.0]),
-    axial_position_error_m=torch.zeros(4),
-    lateral_position_error_m=torch.zeros(4),
-    wrist_rotation_error_rad=torch.zeros(4),
-    grasp_formed=torch.zeros(4, dtype=torch.bool),
-  )
-  assert stage.tolist() == [1, 5, 20, 20]
-
-
-def test_progress_classifier_uses_worst_normalized_error() -> None:
-  stage = classify_grasp_progress_stage(
-    gripper_opening_delta_rad=torch.tensor([0.01]),
-    axial_position_error_m=torch.tensor([0.02]),
-    lateral_position_error_m=torch.tensor([0.075]),
-    wrist_rotation_error_rad=torch.tensor([math.radians(9)]),
-    grasp_formed=torch.tensor([False]),
-  )
-  # Lateral error is 75% of its saturation limit and therefore selects Stage 15.
-  assert stage.item() == 15
+    classify_grasp_state(_features(1), stage_boundaries=(0.5,))
