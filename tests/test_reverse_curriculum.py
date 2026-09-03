@@ -4,6 +4,7 @@ import pytest
 import torch
 from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
   GRASP_DIFFICULTY_COMPONENT_NAMES,
+  GraspStateDifficultyLimits,
   GraspStateFeatures,
   classify_grasp_state,
 )
@@ -71,7 +72,7 @@ def test_contact_state_sets_minimum_ungrasped_stage() -> None:
   assert result.stage.tolist() == [1, 2, 3]
 
 
-def test_worst_component_determines_difficulty() -> None:
+def test_worst_component_dominates_but_secondary_errors_contribute() -> None:
   result = classify_grasp_state(
     _features(
       1,
@@ -81,11 +82,36 @@ def test_worst_component_determines_difficulty() -> None:
       gripper_open_fraction=torch.tensor([0.75]),
     )
   )
-  assert result.stage.item() == 15
-  assert result.difficulty.item() == pytest.approx(0.75)
+  assert result.stage.item() == 16
+  assert result.primary_difficulty.item() == pytest.approx(0.75)
+  assert result.secondary_difficulty.item() == pytest.approx(0.0375)
+  assert result.difficulty.item() == pytest.approx(0.75328125)
   assert GRASP_DIFFICULTY_COMPONENT_NAMES[result.dominant_component.item()] == (
     "gripper_opening"
   )
+
+
+def test_same_maximum_is_harder_with_multiple_secondary_errors() -> None:
+  single_error = classify_grasp_state(
+    _features(1, gripper_open_fraction=torch.tensor([0.50]))
+  )
+  multiple_errors = classify_grasp_state(
+    _features(
+      1,
+      axial_position_error_m=torch.tensor([0.15]),
+      lateral_position_error_m=torch.tensor([0.10]),
+      wrist_rotation_error_rad=torch.tensor([0.50 * math.pi]),
+      gripper_open_fraction=torch.tensor([0.50]),
+      joint_limit_risk=torch.tensor([0.50]),
+    )
+  )
+
+  assert single_error.primary_difficulty.item() == pytest.approx(0.50)
+  assert multiple_errors.primary_difficulty.item() == pytest.approx(0.50)
+  assert multiple_errors.secondary_difficulty.item() == pytest.approx(0.25)
+  assert multiple_errors.difficulty.item() == pytest.approx(0.54375)
+  assert multiple_errors.difficulty.item() > single_error.difficulty.item()
+  assert multiple_errors.stage.item() > single_error.stage.item()
 
 
 def test_extreme_valid_state_saturates_at_stage_twenty() -> None:
@@ -108,3 +134,11 @@ def test_custom_boundaries_are_supported_for_later_calibration() -> None:
 def test_invalid_boundary_count_is_rejected() -> None:
   with pytest.raises(ValueError):
     classify_grasp_state(_features(1), stage_boundaries=(0.5,))
+
+
+def test_invalid_secondary_weight_is_rejected() -> None:
+  with pytest.raises(ValueError):
+    classify_grasp_state(
+      _features(1),
+      limits=GraspStateDifficultyLimits(secondary_difficulty_weight=1.01),
+    )

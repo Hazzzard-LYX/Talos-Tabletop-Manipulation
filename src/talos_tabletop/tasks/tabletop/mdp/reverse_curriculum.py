@@ -67,6 +67,7 @@ class GraspStateDifficultyLimits:
   base_linear_speed_mps: float = 0.50
   base_angular_speed_rad_s: float = 1.00
   hand_object_relative_speed_mps: float = 0.50
+  secondary_difficulty_weight: float = 0.35
   stage_zero_max_projected_gravity_xy: float = 0.15
   stage_zero_max_base_linear_speed_mps: float = 0.10
   stage_zero_max_base_angular_speed_rad_s: float = 0.25
@@ -82,6 +83,8 @@ class GraspStateClassification:
 
   stage: torch.Tensor
   difficulty: torch.Tensor
+  primary_difficulty: torch.Tensor
+  secondary_difficulty: torch.Tensor
   component_difficulties: torch.Tensor
   dominant_component: torch.Tensor
   stable_verified_grasp: torch.Tensor
@@ -99,6 +102,8 @@ def _validate_limits(limits: GraspStateDifficultyLimits) -> None:
   )
   if any(value <= 0.0 for value in saturation_limits):
     raise ValueError("All grasp-state saturation limits must be positive.")
+  if not 0.0 <= limits.secondary_difficulty_weight <= 1.0:
+    raise ValueError("Secondary difficulty weight must lie inside [0, 1].")
 
 
 def _validate_boundaries(boundaries: tuple[float, ...]) -> None:
@@ -120,11 +125,12 @@ def classify_grasp_state(
 ) -> GraspStateClassification:
   """Classify every valid standing state into grasp-progress Stage 0--20.
 
-  The worst normalized component controls difficulty, preventing good position
-  on one axis from compensating for a dangerous wrist, balance, or velocity
-  error. Contact state applies a lower stage bound: zero contacts cannot be
-  easier than Stage 3 and one-link contact cannot be easier than Stage 2.
-  A strict grasp reaches Stage 0 only while the hand-object and base motion are
+  The worst normalized component is the primary difficulty. The mean of the
+  remaining components adds a smaller bounded penalty, so a dangerous error is
+  never averaged away while multiple simultaneous errors still make the state
+  harder. Contact state applies a lower stage bound: zero contacts cannot be
+  easier than Stage 3 and one-link contact cannot be easier than Stage 2. A
+  strict grasp reaches Stage 0 only while the hand-object and base motion are
   inside the dedicated stability limits.
   """
   _validate_limits(limits)
@@ -172,7 +178,15 @@ def classify_grasp_state(
     ),
     dim=-1,
   ).clamp(min=0.0, max=1.0)
-  difficulty, dominant_component = components.max(dim=-1)
+  primary_difficulty, dominant_component = components.max(dim=-1)
+  secondary_difficulty = (
+    components.sum(dim=-1) - primary_difficulty
+  ) / (components.shape[-1] - 1)
+  difficulty = primary_difficulty + (
+    limits.secondary_difficulty_weight
+    * (1.0 - primary_difficulty)
+    * secondary_difficulty
+  )
 
   boundaries = torch.tensor(
     stage_boundaries, device=difficulty.device, dtype=difficulty.dtype
@@ -218,6 +232,8 @@ def classify_grasp_state(
   return GraspStateClassification(
     stage=stage,
     difficulty=difficulty,
+    primary_difficulty=primary_difficulty,
+    secondary_difficulty=secondary_difficulty,
     component_difficulties=components,
     dominant_component=dominant_component,
     stable_verified_grasp=stable_verified_grasp,
