@@ -23,6 +23,8 @@ RUN_NAME="${RUN_NAME:-${SHORT_REVISION}-${NUM_ENVS}env}"
 RUN_ROOT="${WORKSPACE}/logs/talos-tabletop-training/${SHORT_REVISION}/${SLURM_JOB_ID}"
 RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-}"
 INIT_CHECKPOINT_PATH="${INIT_CHECKPOINT_PATH:-}"
+INIT_ACTOR_ADDED_DIMS="${INIT_ACTOR_ADDED_DIMS:-2}"
+INIT_CRITIC_ADDED_DIMS="${INIT_CRITIC_ADDED_DIMS:-2}"
 INITIAL_STAGE="${INITIAL_STAGE:-0}"
 
 export TMPDIR="${SLURM_TMPDIR:-${WORKSPACE}/tmp/${SLURM_JOB_ID}}"
@@ -99,8 +101,8 @@ if [[ -n "${INIT_CHECKPOINT_PATH}" ]]; then
   "${PYTHON}" slurm/migrate_grasp_checkpoint.py \
     --input "${INIT_CHECKPOINT_PATH}" \
     --output "${RESUME_DIR}/model_init.pt" \
-    --actor-added-dims 2 \
-    --critic-added-dims 2
+    --actor-added-dims "${INIT_ACTOR_ADDED_DIMS}" \
+    --critic-added-dims "${INIT_CRITIC_ADDED_DIMS}"
   export TALOS_INIT_WEIGHTS_ONLY=1
   TRAIN_ARGS+=(
     --agent.resume True

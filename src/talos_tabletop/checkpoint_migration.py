@@ -10,9 +10,11 @@ import torch
 def _expand_observation_state(
   state_dict: dict[str, torch.Tensor], added_dims: int
 ) -> dict[str, torch.Tensor]:
-  if added_dims <= 0:
-    raise ValueError("added_dims must be positive")
+  if added_dims < 0:
+    raise ValueError("added_dims must be non-negative")
   migrated = dict(state_dict)
+  if added_dims == 0:
+    return migrated
   first_layer_key = "mlp.0.weight"
   if first_layer_key not in migrated:
     raise KeyError(f"Checkpoint is missing {first_layer_key}")
