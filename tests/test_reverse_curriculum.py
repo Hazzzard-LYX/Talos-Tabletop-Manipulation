@@ -175,7 +175,7 @@ def test_reverse_curriculum_defines_all_twenty_training_stages() -> None:
     assert definition.promotion_evaluation_stage == stage
     assert definition.evaluation_episodes == 4096
     assert definition.success_hold_duration_s == pytest.approx(5.0)
-    assert definition.success_lift_height_m == pytest.approx(0.06)
+    assert definition.success_lift_height_m == pytest.approx(0.08)
 
 
 def test_final_stage_uses_seventy_thirty_mixture_without_promotion() -> None:
