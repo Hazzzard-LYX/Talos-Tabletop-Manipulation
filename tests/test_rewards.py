@@ -185,6 +185,53 @@ def test_contact_lift_hold_requires_airborne_height_and_distinct_links(
   assert mdp.contact_verified_lift_hold(env, **params).item() == 0.0
 
 
+def test_contact_height_target_penalizes_height_error_speed_and_lost_contact(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  obj = SimpleNamespace(
+    data=SimpleNamespace(
+      root_link_pos_w=torch.tensor([[0.0, 0.0, 0.97]]),
+      root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+      root_link_vel_w=torch.zeros((1, 6)),
+    )
+  )
+  env = SimpleNamespace(
+    scene=_Scene(object=obj, contact=object()),
+    extras={"log": {}},
+  )
+  env.device = "cpu"
+  contact_gate = torch.tensor([True])
+  monkeypatch.setattr(
+    reward_functions,
+    "_contact_link_mask",
+    lambda *args, **kwargs: contact_gate,
+  )
+  params = {
+    "initial_center_height": 0.89,
+    "table_height": 0.86,
+    "target_lift_height": 0.08,
+    "height_error_std": 0.025,
+    "object_speed_std": 0.08,
+    "sensor_name": "contact",
+    "minimum_contact_links": 2,
+    "object_half_extents": (0.03, 0.03, 0.03),
+    "clearance_margin": 0.0,
+  }
+
+  at_target = mdp.contact_verified_height_target(env, **params)
+  assert at_target.item() == pytest.approx(1.0)
+  obj.data.root_link_pos_w[0, 2] = 0.93
+  wrong_height = mdp.contact_verified_height_target(env, **params)
+  assert 0.0 < wrong_height.item() < at_target.item()
+  obj.data.root_link_pos_w[0, 2] = 0.97
+  obj.data.root_link_vel_w[0, 0] = 0.20
+  moving = mdp.contact_verified_height_target(env, **params)
+  assert 0.0 < moving.item() < at_target.item()
+  obj.data.root_link_vel_w.zero_()
+  contact_gate[:] = False
+  assert mdp.contact_verified_height_target(env, **params).item() == 0.0
+
+
 def test_excessive_height_penalty_starts_above_thirty_centimeters() -> None:
   obj = SimpleNamespace(
     data=SimpleNamespace(root_link_pos_w=torch.tensor([[0.0, 0.0, 1.19]]))

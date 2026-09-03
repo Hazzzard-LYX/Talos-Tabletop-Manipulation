@@ -759,6 +759,87 @@ def contact_verified_lift_hold(
   return hold_quality
 
 
+def contact_verified_lift_height(
+  env: ManagerBasedRlEnv,
+  initial_center_height: float,
+  table_height: float,
+  target_lift_height: float,
+  sensor_name: str,
+  minimum_contact_links: int,
+  object_half_extents: tuple[float, float, float] | None = None,
+  sphere_radius: float | None = None,
+  clearance_margin: float = 0.002,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Continuously reward verified lift height instead of a historical peak.
+
+  A transient throw earns only while the object is actually high and retains
+  force closure.  Returning to the table immediately removes the reward.
+  """
+  obj: Entity = env.scene[object_cfg.name]
+  _, _, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height,
+    table_height,
+    object_half_extents,
+    sphere_radius,
+    clearance_margin,
+  )
+  height_quality = (effective_lift / target_lift_height).clamp(0.0, 1.0)
+  sensor = env.scene[sensor_name]
+  contact_gate = _contact_link_mask(sensor, minimum_contact_links).float()
+  verified_height = height_quality * contact_gate
+  env.extras["log"]["Metrics/verified_lift_height_quality"] = (
+    verified_height.mean()
+  )
+  return verified_height
+
+
+def contact_verified_height_target(
+  env: ManagerBasedRlEnv,
+  initial_center_height: float,
+  table_height: float,
+  target_lift_height: float,
+  height_error_std: float,
+  object_speed_std: float,
+  sensor_name: str,
+  minimum_contact_links: int,
+  object_half_extents: tuple[float, float, float] | None = None,
+  sphere_radius: float | None = None,
+  clearance_margin: float = 0.002,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Reward low-speed multi-link holding at one target clearance."""
+  obj: Entity = env.scene[object_cfg.name]
+  _, _, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height,
+    table_height,
+    object_half_extents,
+    sphere_radius,
+    clearance_margin,
+  )
+  height_error = effective_lift - target_lift_height
+  height_quality = torch.exp(-0.5 * torch.square(height_error / height_error_std))
+  object_speed = torch.linalg.vector_norm(
+    obj.data.root_link_vel_w[:, :3], dim=1
+  )
+  speed_quality = torch.exp(-0.5 * torch.square(object_speed / object_speed_std))
+  sensor = env.scene[sensor_name]
+  contact_gate = _contact_link_mask(sensor, minimum_contact_links).float()
+  target_quality = height_quality * speed_quality * contact_gate
+  env.extras["log"]["Metrics/contact_height_error_m"] = (
+    torch.abs(height_error).mean()
+  )
+  env.extras["log"]["Metrics/contact_height_target_quality"] = (
+    target_quality.mean()
+  )
+  env.extras["log"]["Metrics/contact_height_speed_quality"] = (
+    speed_quality.mean()
+  )
+  return target_quality
+
+
 def _contact_link_mask(
   sensor: ContactSensor,
   minimum_contact_links: int,
@@ -810,6 +891,8 @@ class sustained_verified_pick_success:
     maximum_relative_speed: float,
     maximum_object_speed: float,
     metric_prefix: str,
+    target_lift_height: float | None = None,
+    maximum_height_error: float | None = None,
     object_half_extents: tuple[float, float, float] | None = None,
     sphere_radius: float | None = None,
     clearance_margin: float = 0.002,
@@ -861,8 +944,17 @@ class sustained_verified_pick_success:
       if not isinstance(sensor, ContactSensor):
         raise TypeError(f"'{sensor_name}' must be a ContactSensor.")
       grasp_valid &= _contact_link_mask(sensor, minimum_contact_links)
+    height_valid = effective_lift >= minimum_lift_height
+    if target_lift_height is not None or maximum_height_error is not None:
+      if target_lift_height is None or maximum_height_error is None:
+        raise ValueError(
+          "target_lift_height and maximum_height_error must be provided together."
+        )
+      height_valid &= (
+        torch.abs(effective_lift - target_lift_height) <= maximum_height_error
+      )
     valid = (
-      (effective_lift >= minimum_lift_height)
+      height_valid
       & grasp_valid
       & (relative_speed <= maximum_relative_speed)
       & (object_speed <= maximum_object_speed)

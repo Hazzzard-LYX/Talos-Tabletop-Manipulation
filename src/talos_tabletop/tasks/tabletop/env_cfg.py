@@ -48,22 +48,23 @@ ROBOT_SPAWN_POSITION_M = (
   1.0,
 )
 STATIONARY_GRASP_ROBOT_POSITION_M = (0.0, 0.0, 1.0)
-# Whole-body IK seed with the right gripper vertical and surrounding the cube.
-# The object remains a free body resting on the table; there is no weld or
-# kinematic attachment.  This is the first, deterministic seed of the reverse
-# curriculum and will be broadened only after lift learning is verified.
-STABLE_CONTACT_RIGHT_ARM_JOINT_POS = {
-  "torso_1_joint": 0.08225144,
-  "torso_2_joint": 0.15536115,
-  "arm_right_1_joint": 1.00006984,
-  "arm_right_2_joint": -1.37780233,
-  "arm_right_3_joint": 0.45085106,
-  "arm_right_4_joint": -1.17695711,
-  "arm_right_5_joint": 0.09258695,
-  "arm_right_6_joint": 0.96042251,
-  "arm_right_7_joint": 0.02762244,
+STABLE_HOLD_TARGET_LIFT_HEIGHT_M = 0.08
+STABLE_HOLD_GRIPPER_POSITION = -0.7306
+STABLE_HOLD_OBJECT_POSITION_M = (0.59653, -0.17855, 0.97)
+STABLE_HOLD_OBJECT_ROT_WXYZ = (0.993452, 0.0, 0.0, -0.11425)
+# IK solution which preserves the selected three-finger cube pose while placing
+# the cube center exactly 8 cm above its original tabletop height.
+STABLE_HOLD_RIGHT_ARM_JOINT_POS = {
+  "torso_1_joint": 0.0795394546,
+  "torso_2_joint": 0.0880841381,
+  "arm_right_1_joint": 0.9994535929,
+  "arm_right_2_joint": -1.4058058187,
+  "arm_right_3_joint": 0.4492669156,
+  "arm_right_4_joint": -1.1972966978,
+  "arm_right_5_joint": 0.0632891793,
+  "arm_right_6_joint": 1.0235641200,
+  "arm_right_7_joint": -0.0060439499,
 }
-STABLE_CONTACT_GRIPPER_POSITION = 0.0
 HIDDEN_SCENE_X_OFFSET_M = 10.0
 TABLE_APPROACH_BASE_XY_M = (0.0, 0.0)
 MAX_COLLISION_OBSTACLES = 8
@@ -633,9 +634,10 @@ def talos_tabletop_grasp_env_cfg(
     name="right_gripper_object_contact",
     primary=ContactMatch(mode="body", pattern=right_hand_pattern, entity="robot"),
     secondary=ContactMatch(mode="body", pattern="object", entity="object"),
-    fields=("found", "force", "pos", "normal"),
+    fields=("found", "force", "pos", "normal", "tangent"),
     reduce="none",
     num_slots=4,
+    global_frame=True,
     track_air_time=True,
     history_length=cfg.decimation,
   )
@@ -1524,7 +1526,7 @@ def talos_tabletop_stationary_grasp_env_cfg(
 def talos_tabletop_stable_contact_lift_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Train only contact maintenance, balance, and cube lift from an IK seed."""
+  """Train an 8 cm airborne force-closure hold from an IK contact seed."""
   cfg = talos_tabletop_stationary_grasp_env_cfg(
     object_shape="cube",
     play=play,
@@ -1545,12 +1547,12 @@ def talos_tabletop_stable_contact_lift_env_cfg(
       "arm_left_5_joint": 0.0,
       "arm_left_6_joint": 0.0,
       "arm_left_7_joint": 0.0,
-      **STABLE_CONTACT_RIGHT_ARM_JOINT_POS,
+      **STABLE_HOLD_RIGHT_ARM_JOINT_POS,
     }
   )
   for side, main_position in (
     ("left", -0.24),
-    ("right", STABLE_CONTACT_GRIPPER_POSITION),
+    ("right", STABLE_HOLD_GRIPPER_POSITION),
   ):
     joint_pos.update(
       {
@@ -1565,8 +1567,12 @@ def talos_tabletop_stable_contact_lift_env_cfg(
     )
   robot_cfg.init_state.joint_pos = joint_pos
 
-  # Keep the object exactly at the IK seed for this first experiment.  It is
-  # still a six-DoF free body, initially resting on the table between fingers.
+  # A true reverse curriculum begins from the completed skill.  The cube is a
+  # six-DoF free body at the 8 cm target; no weld or kinematic attachment is
+  # introduced.  The nonzero yaw and lateral offset place the cube inside the
+  # useful three-finger closing envelope instead of the old fully-open seed.
+  cfg.scene.entities["object"].init_state.pos = STABLE_HOLD_OBJECT_POSITION_M
+  cfg.scene.entities["object"].init_state.rot = STABLE_HOLD_OBJECT_ROT_WXYZ
   cfg.events["reset_robot_joints"].params.update(
     {"position_range": (0.0, 0.0), "velocity_range": (0.0, 0.0)}
   )
@@ -1607,9 +1613,11 @@ def talos_tabletop_stable_contact_lift_env_cfg(
     "lower_body_lateral_pose": -0.5,
     "left_arm_pose": -0.5,
     "right_arm_pose": -0.02,
-    "multi_link_contact": 1.0,
+    "multi_link_contact": 0.25,
+    "face_contact_area": 2.0,
+    "force_closure": 4.0,
     "gripper_reopening": -1.0,
-    "object_launch": -10.0,
+    "object_launch": -20.0,
     "task_time": -0.01,
     "excessive_object_height": -20.0,
   }
@@ -1618,29 +1626,31 @@ def talos_tabletop_stable_contact_lift_env_cfg(
 
   initial_center_height = object_initial_position("cube")[2]
   cfg.rewards["contact_lift_progress"] = RewardTermCfg(
-    func=mdp.object_lift_record_progress,
-    weight=40.0,
+    func=mdp.contact_verified_lift_height,
+    weight=6.0,
     params={
       "initial_center_height": initial_center_height,
       "table_height": TABLE_TOP_HEIGHT_M,
-      "target_lift_height": 0.08,
+      "target_lift_height": STABLE_HOLD_TARGET_LIFT_HEIGHT_M,
       "sensor_name": "right_gripper_object_contact",
-      "minimum_grasp_quality": 0.0,
       "minimum_contact_links": 2,
       "object_half_extents": CUBE_HALF_SIZE_M,
+      "clearance_margin": 0.0,
     },
   )
-  cfg.rewards["contact_lift_hold"] = RewardTermCfg(
-    func=mdp.contact_verified_lift_hold,
-    weight=12.0,
+  cfg.rewards["contact_height_target"] = RewardTermCfg(
+    func=mdp.contact_verified_height_target,
+    weight=20.0,
     params={
       "initial_center_height": initial_center_height,
       "table_height": TABLE_TOP_HEIGHT_M,
-      "target_lift_height": 0.06,
+      "target_lift_height": STABLE_HOLD_TARGET_LIFT_HEIGHT_M,
+      "height_error_std": 0.025,
+      "object_speed_std": 0.15,
       "sensor_name": "right_gripper_object_contact",
       "minimum_contact_links": 2,
       "object_half_extents": CUBE_HALF_SIZE_M,
-      "exponent": 2.0,
+      "clearance_margin": 0.0,
     },
   )
   cfg.rewards["contact_lift_success"] = RewardTermCfg(
@@ -1652,13 +1662,16 @@ def talos_tabletop_stable_contact_lift_env_cfg(
       "initial_center_height": initial_center_height,
       "table_height": TABLE_TOP_HEIGHT_M,
       "minimum_lift_height": 0.06,
-      "required_duration_s": 0.50,
+      "target_lift_height": STABLE_HOLD_TARGET_LIFT_HEIGHT_M,
+      "maximum_height_error": 0.015,
+      "required_duration_s": 5.0,
       "minimum_contact_links": 2,
-      "minimum_grasp_quality": 0.0,
+      "minimum_grasp_quality": 0.01,
       "maximum_relative_speed": 0.08,
       "maximum_object_speed": 0.12,
       "metric_prefix": "contact_lift",
       "object_half_extents": CUBE_HALF_SIZE_M,
+      "clearance_margin": 0.0,
     },
   )
   cfg.terminations["object_lost"].params["minimum_height"] = (

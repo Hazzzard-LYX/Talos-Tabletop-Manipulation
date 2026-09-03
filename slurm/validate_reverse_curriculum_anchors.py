@@ -21,6 +21,7 @@ from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
   GRASP_DIFFICULTY_COMPONENT_NAMES,
   GraspStateFeatures,
   classify_grasp_state,
+  talos_gripper_open_fraction,
 )
 
 TASK = "Mjlab-Tabletop-Stable-Contact-Lift-Cube-Talos-v0"
@@ -96,8 +97,8 @@ def _initial_classification(
       wrist_rotation_error_rad=quat_error_magnitude(
         reference_quat, robot.data.site_quat_w[:, site_id]
       ),
-      gripper_open_fraction=(
-        robot.data.joint_pos[:, gripper_id].abs() / RIGHT_GRIPPER_RANGE_RAD
+      gripper_open_fraction=talos_gripper_open_fraction(
+        robot.data.joint_pos[:, gripper_id], RIGHT_GRIPPER_RANGE_RAD
       ),
       joint_limit_risk=joint_limit_risk,
       projected_gravity_xy=torch.linalg.vector_norm(

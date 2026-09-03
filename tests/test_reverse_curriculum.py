@@ -10,6 +10,7 @@ from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
   assess_reverse_curriculum_promotion,
   build_reverse_curriculum_stage_definitions,
   classify_grasp_state,
+  talos_gripper_open_fraction,
 )
 
 
@@ -29,6 +30,14 @@ def _features(batch_size: int, **overrides: torch.Tensor) -> GraspStateFeatures:
   }
   defaults.update(overrides)
   return GraspStateFeatures(**defaults)
+
+
+def test_talos_gripper_joint_sign_maps_closed_and_open_correctly() -> None:
+  positions = torch.tensor([-0.959931, -0.4799655, 0.0])
+  assert torch.allclose(
+    talos_gripper_open_fraction(positions),
+    torch.tensor([0.0, 0.5, 1.0]),
+  )
 
 
 def test_all_twenty_ungrasped_stages_are_reachable() -> None:

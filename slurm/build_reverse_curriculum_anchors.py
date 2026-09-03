@@ -19,10 +19,11 @@ import numpy as np
 import talos_tabletop.tasks  # noqa: F401  # Register before MJLab plugin discovery.
 import torch
 from scipy.optimize import least_squares
-from talos_tabletop.assets import object_initial_position
 from talos_tabletop.robots.talos.constants import get_grasping_spec
 from talos_tabletop.tasks.tabletop.env_cfg import (
-  STABLE_CONTACT_GRIPPER_POSITION,
+  STABLE_HOLD_GRIPPER_POSITION,
+  STABLE_HOLD_OBJECT_POSITION_M,
+  STABLE_HOLD_OBJECT_ROT_WXYZ,
   talos_tabletop_stable_contact_lift_env_cfg,
 )
 from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
@@ -30,6 +31,7 @@ from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
   GRASP_DIFFICULTY_COMPONENT_NAMES,
   GraspStateFeatures,
   classify_grasp_state,
+  talos_gripper_open_fraction,
 )
 
 SCHEMA_VERSION = 1
@@ -222,7 +224,7 @@ def _candidate_features(
     axial_position_error_m=torch.tensor(abs(signed_axial)),
     lateral_position_error_m=torch.tensor(np.linalg.norm(lateral_vector)),
     wrist_rotation_error_rad=torch.tensor(np.linalg.norm(rotation_vector)),
-    gripper_open_fraction=torch.tensor(abs(gripper_position) / RIGHT_GRIPPER_RANGE_RAD),
+    gripper_open_fraction=talos_gripper_open_fraction(torch.tensor(gripper_position)),
     joint_limit_risk=torch.tensor(joint_risk),
     projected_gravity_xy=torch.tensor(0.0),
     base_linear_speed_mps=torch.tensor(0.0),
@@ -333,7 +335,7 @@ def build_candidates(
   data = mujoco.MjData(model)
   reference_qpos, joint_names, joint_qpos_addresses = _resolve_default_qpos(model)
   _set_coupled_gripper(
-    model, reference_qpos, "right", STABLE_CONTACT_GRIPPER_POSITION
+    model, reference_qpos, "right", STABLE_HOLD_GRIPPER_POSITION
   )
   data.qpos[:] = reference_qpos
   mujoco.mj_forward(model, data)
@@ -351,8 +353,9 @@ def build_candidates(
     ]
   )
   ik_qpos_addresses = model.jnt_qposadr[ik_joint_ids]
-  object_position = object_initial_position("cube")
-  object_root_state = np.asarray((*object_position, 1.0, 0.0, 0.0, 0.0, *([0.0] * 6)))
+  object_root_state = np.asarray(
+    (*STABLE_HOLD_OBJECT_POSITION_M, *STABLE_HOLD_OBJECT_ROT_WXYZ, *([0.0] * 6))
+  )
   robot_root_state = np.asarray((0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, *([0.0] * 6)))
   rng = np.random.default_rng(seed)
   selected_anchors = []
@@ -383,7 +386,10 @@ def build_candidates(
         continue
       qpos, ik_position_error, ik_rotation_error = solution
       _set_coupled_gripper(
-        model, qpos, "right", -gripper_open * RIGHT_GRIPPER_RANGE_RAD
+        model,
+        qpos,
+        "right",
+        -(1.0 - gripper_open) * RIGHT_GRIPPER_RANGE_RAD,
       )
       features, signed_error, _ = _candidate_features(
         model,

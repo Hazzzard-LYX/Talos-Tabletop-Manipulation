@@ -180,6 +180,19 @@ class GraspStateFeatures:
   verified_grasp: torch.Tensor
 
 
+def talos_gripper_open_fraction(
+  joint_position: torch.Tensor,
+  joint_range_rad: float = 0.959931,
+) -> torch.Tensor:
+  """Map TALOS gripper position to 0=closed and 1=open.
+
+  The hardware/MJCF joint runs from approximately ``-0.96`` (closed) to
+  ``0.0`` (open).  Using absolute joint position directly reverses the
+  curriculum ordering.
+  """
+  return (1.0 - torch.abs(joint_position) / joint_range_rad).clamp(0.0, 1.0)
+
+
 @dataclass(frozen=True)
 class GraspStateDifficultyLimits:
   """Initial saturation and Stage-0 stability limits for the classifier."""
