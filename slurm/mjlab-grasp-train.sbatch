@@ -61,13 +61,18 @@ TRAIN_ARGS=(
 
 if [[ "${INITIAL_STAGE}" != "0" ]]; then
   TRAIN_ARGS+=(
+)
+if [[ "${INITIAL_STAGE}" != "none" ]]; then
+  TRAIN_ARGS+=(
     --env.curriculum.task-stage.params.initial-stage "${INITIAL_STAGE}"
   )
+fi
 fi
 
 if [[ -n "${RESUME_CHECKPOINT_PATH}" || -n "${INIT_CHECKPOINT_PATH}" ]]; then
   case "${TASK}" in
     *Position-Tracking*) EXPERIMENT_NAME="talos_tabletop_position_tracking" ;;
+    *Stable-Contact-Lift-Cube*) EXPERIMENT_NAME="talos_tabletop_stable_contact_lift_cube" ;;
     *Stationary-Grasp-Cube*) EXPERIMENT_NAME="talos_tabletop_stationary_grasp_cube" ;;
     *Stationary-Grasp-Sphere*) EXPERIMENT_NAME="talos_tabletop_stationary_grasp_sphere" ;;
     *Cube*) EXPERIMENT_NAME="talos_tabletop_grasp_cube_privileged_position" ;;

@@ -668,6 +668,7 @@ class object_lift_record_progress:
     contacts_for_full_area: int = 6,
     links_for_full_area: int = 3,
     friction_coefficient: float = 1.5,
+    minimum_contact_links: int | None = None,
     object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
   ) -> torch.Tensor:
     obj: Entity = env.scene[object_cfg.name]
@@ -690,7 +691,13 @@ class object_lift_record_progress:
       friction_coefficient,
       object_cfg,
     )
-    quality_gate = (grasp_quality / minimum_grasp_quality).clamp(0.0, 1.0)
+    if minimum_contact_links is None:
+      quality_gate = (grasp_quality / minimum_grasp_quality).clamp(0.0, 1.0)
+    else:
+      sensor = env.scene[sensor_name]
+      if not isinstance(sensor, ContactSensor):
+        raise TypeError(f"'{sensor_name}' must be a ContactSensor.")
+      quality_gate = _contact_link_mask(sensor, minimum_contact_links).float()
     verified_progress = progress * quality_gate
     improvement = (verified_progress - self._best).clamp(min=0.0)
     self._best = torch.maximum(self._best, verified_progress)
@@ -704,6 +711,20 @@ class object_lift_record_progress:
     if env_ids is None:
       env_ids = slice(None)
     self._best[env_ids] = 0.0
+
+
+def _contact_link_mask(
+  sensor: ContactSensor,
+  minimum_contact_links: int,
+) -> torch.Tensor:
+  """Return environments with contact on enough independent hand links."""
+  if sensor.data.found is None:
+    raise TypeError("Contact-link gating requires ContactSensor found data.")
+  primary_count = len(sensor.primary_names)
+  found = sensor.data.found.reshape(
+    sensor.data.found.shape[0], primary_count, sensor.cfg.num_slots
+  )
+  return found.any(dim=2).sum(dim=1) >= minimum_contact_links
 
 
 class sustained_verified_pick_success:
@@ -750,6 +771,7 @@ class sustained_verified_pick_success:
     contacts_for_full_area: int = 6,
     links_for_full_area: int = 3,
     friction_coefficient: float = 1.5,
+    minimum_contact_links: int | None = None,
     robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
   ) -> torch.Tensor:
@@ -787,9 +809,15 @@ class sustained_verified_pick_success:
     object_speed = torch.linalg.vector_norm(
       obj.data.root_link_vel_w[:, :3], dim=1
     )
+    grasp_valid = grasp_quality >= minimum_grasp_quality
+    if minimum_contact_links is not None:
+      sensor = env.scene[sensor_name]
+      if not isinstance(sensor, ContactSensor):
+        raise TypeError(f"'{sensor_name}' must be a ContactSensor.")
+      grasp_valid &= _contact_link_mask(sensor, minimum_contact_links)
     valid = (
       (effective_lift >= minimum_lift_height)
-      & (grasp_quality >= minimum_grasp_quality)
+      & grasp_valid
       & (relative_speed <= maximum_relative_speed)
       & (object_speed <= maximum_object_speed)
     )

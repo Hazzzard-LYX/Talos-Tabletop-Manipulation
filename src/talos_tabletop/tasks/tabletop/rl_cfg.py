@@ -72,3 +72,12 @@ def talos_tabletop_stationary_grasp_ppo_runner_cfg(
   cfg.save_interval = 250
   cfg.max_iterations = 20_000
   return cfg
+
+
+def talos_tabletop_stable_contact_lift_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """Return the first reverse-curriculum contact-to-lift runner."""
+  cfg = talos_tabletop_ppo_runner_cfg()
+  cfg.experiment_name = "talos_tabletop_stable_contact_lift_cube"
+  cfg.save_interval = 100
+  cfg.max_iterations = 10_000
+  return cfg

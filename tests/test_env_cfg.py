@@ -11,6 +11,7 @@ from talos_tabletop.tasks.tabletop.env_cfg import (
   talos_tabletop_grasp_env_cfg,
   talos_tabletop_position_tracking_env_cfg,
   talos_tabletop_reaching_env_cfg,
+  talos_tabletop_stable_contact_lift_env_cfg,
   talos_tabletop_stationary_grasp_env_cfg,
 )
 
@@ -221,3 +222,23 @@ def test_stationary_grasp_task_has_verified_pick_curriculum() -> None:
   assert cfg.scene.sensors[0].track_air_time is True
   assert cfg.rewards["low_lift_success"].params["required_duration_s"] == 0.50
   assert cfg.rewards["grasp_lift_success"].params["required_duration_s"] == 1.0
+
+
+def test_stable_contact_lift_is_single_stage_and_checkpoint_compatible() -> None:
+  cfg = talos_tabletop_stable_contact_lift_env_cfg()
+
+  assert cfg.curriculum == {}
+  assert cfg.scene.num_envs == 2048
+  assert cfg.events["reset_object_on_pickup_zone"].params["pose_range"] == {}
+  assert cfg.scene.entities["robot"].init_state.joint_pos[
+    "gripper_right_joint"
+  ] == pytest.approx(0.0)
+  assert cfg.observations["actor"].terms[
+    "privileged_object_center_b"
+  ].params == {}
+  assert "minimum_curriculum_stage" not in cfg.observations["actor"].terms[
+    "collision_obstacle_boxes_b"
+  ].params
+  assert cfg.rewards["contact_lift_progress"].weight == 40.0
+  assert cfg.rewards["contact_lift_success"].weight == 80.0
+  assert cfg.rewards["lift_progress"].weight == 0.0

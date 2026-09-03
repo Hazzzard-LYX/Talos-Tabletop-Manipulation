@@ -48,6 +48,22 @@ ROBOT_SPAWN_POSITION_M = (
   1.0,
 )
 STATIONARY_GRASP_ROBOT_POSITION_M = (0.0, 0.0, 1.0)
+# Whole-body IK seed with the right gripper vertical and surrounding the cube.
+# The object remains a free body resting on the table; there is no weld or
+# kinematic attachment.  This is the first, deterministic seed of the reverse
+# curriculum and will be broadened only after lift learning is verified.
+STABLE_CONTACT_RIGHT_ARM_JOINT_POS = {
+  "torso_1_joint": 0.08225144,
+  "torso_2_joint": 0.15536115,
+  "arm_right_1_joint": 1.00006984,
+  "arm_right_2_joint": -1.37780233,
+  "arm_right_3_joint": 0.45085106,
+  "arm_right_4_joint": -1.17695711,
+  "arm_right_5_joint": 0.09258695,
+  "arm_right_6_joint": 0.96042251,
+  "arm_right_7_joint": 0.02762244,
+}
+STABLE_CONTACT_GRIPPER_POSITION = 0.0
 HIDDEN_SCENE_X_OFFSET_M = 10.0
 TABLE_APPROACH_BASE_XY_M = (0.0, 0.0)
 MAX_COLLISION_OBSTACLES = 8
@@ -1502,4 +1518,139 @@ def talos_tabletop_stationary_grasp_env_cfg(
       },
     )
   }
+  return cfg
+
+
+def talos_tabletop_stable_contact_lift_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Train only contact maintenance, balance, and cube lift from an IK seed."""
+  cfg = talos_tabletop_stationary_grasp_env_cfg(
+    object_shape="cube",
+    play=play,
+  )
+
+  robot_cfg = cfg.scene.entities["robot"]
+  joint_pos = dict(robot_cfg.init_state.joint_pos or {})
+  # Replace shared regex entries so the IK values cannot be shadowed during
+  # initial-state name resolution.
+  for pattern in tuple(joint_pos):
+    if pattern.startswith("arm_.*_") or pattern.startswith("gripper_.*_"):
+      joint_pos.pop(pattern)
+    elif pattern.startswith("gripper_(left|right)"):
+      joint_pos.pop(pattern)
+  joint_pos.update(
+    {
+      "arm_left_4_joint": -1.5,
+      "arm_left_5_joint": 0.0,
+      "arm_left_6_joint": 0.0,
+      "arm_left_7_joint": 0.0,
+      **STABLE_CONTACT_RIGHT_ARM_JOINT_POS,
+    }
+  )
+  for side, main_position in (
+    ("left", -0.24),
+    ("right", STABLE_CONTACT_GRIPPER_POSITION),
+  ):
+    joint_pos.update(
+      {
+        f"gripper_{side}_joint": main_position,
+        f"gripper_{side}_inner_double_joint": main_position,
+        f"gripper_{side}_motor_single_joint": -main_position,
+        f"gripper_{side}_inner_single_joint": -main_position,
+        f"gripper_{side}_fingertip_1_joint": -main_position,
+        f"gripper_{side}_fingertip_2_joint": -main_position,
+        f"gripper_{side}_fingertip_3_joint": -main_position,
+      }
+    )
+  robot_cfg.init_state.joint_pos = joint_pos
+
+  # Keep the object exactly at the IK seed for this first experiment.  It is
+  # still a six-DoF free body, initially resting on the table between fingers.
+  cfg.events["reset_robot_joints"].params.update(
+    {"position_range": (0.0, 0.0), "velocity_range": (0.0, 0.0)}
+  )
+  cfg.events["reset_object_on_pickup_zone"].params.update(
+    {"pose_range": {}, "velocity_range": {}}
+  )
+  cfg.curriculum = {}
+
+  # Stationary-task observations were hidden in curriculum stage zero.  Make
+  # them unconditionally visible while preserving the exact 222/225 network
+  # dimensions of the reusable standing checkpoint.
+  for group in cfg.observations.values():
+    obstacle_params = dict(group.terms["collision_obstacle_boxes_b"].params)
+    obstacle_params.pop("minimum_curriculum_stage", None)
+    group.terms["collision_obstacle_boxes_b"] = ObservationTermCfg(
+      func=mdp.obstacle_boxes_in_robot_frame,
+      params=obstacle_params,
+    )
+    group.terms["privileged_object_center_b"] = ObservationTermCfg(
+      func=mdp.object_position_in_robot_frame,
+    )
+
+  disabled_weights = {name: 0.0 for name in cfg.rewards}
+  lift_weights = {
+    **disabled_weights,
+    "termination_penalty": -200.0,
+    "dof_pos_limits": -1.0,
+    "action_magnitude_l2": -0.01,
+    "action_rate_l2": -0.03,
+    "joint_vel_hinge": -0.02,
+    "upright": 3.0,
+    "both_feet_contact": 1.0,
+    "standing_success": 1.0,
+    "base_motion": -0.5,
+    "base_drift": -4.0,
+    "foot_slip": -0.5,
+    "lower_body_pose": -0.3,
+    "lower_body_lateral_pose": -0.5,
+    "left_arm_pose": -0.5,
+    "right_arm_pose": -0.02,
+    "multi_link_contact": 1.0,
+    "gripper_reopening": -1.0,
+    "object_launch": -10.0,
+    "task_time": -0.01,
+    "excessive_object_height": -20.0,
+  }
+  for name, weight in lift_weights.items():
+    cfg.rewards[name].weight = weight
+
+  initial_center_height = object_initial_position("cube")[2]
+  cfg.rewards["contact_lift_progress"] = RewardTermCfg(
+    func=mdp.object_lift_record_progress,
+    weight=40.0,
+    params={
+      "initial_center_height": initial_center_height,
+      "table_height": TABLE_TOP_HEIGHT_M,
+      "target_lift_height": 0.08,
+      "sensor_name": "right_gripper_object_contact",
+      "minimum_grasp_quality": 0.0,
+      "minimum_contact_links": 2,
+      "object_half_extents": CUBE_HALF_SIZE_M,
+    },
+  )
+  cfg.rewards["contact_lift_success"] = RewardTermCfg(
+    func=mdp.sustained_verified_pick_success,
+    weight=80.0,
+    params={
+      "sensor_name": "right_gripper_object_contact",
+      "site_name": "right_grasp_center",
+      "initial_center_height": initial_center_height,
+      "table_height": TABLE_TOP_HEIGHT_M,
+      "minimum_lift_height": 0.06,
+      "required_duration_s": 0.50,
+      "minimum_contact_links": 2,
+      "minimum_grasp_quality": 0.0,
+      "maximum_relative_speed": 0.08,
+      "maximum_object_speed": 0.12,
+      "metric_prefix": "contact_lift",
+      "object_half_extents": CUBE_HALF_SIZE_M,
+    },
+  )
+  cfg.terminations["object_lost"].params["minimum_height"] = (
+    TABLE_TOP_HEIGHT_M - 0.12
+  )
+  cfg.scene.num_envs = 2048 if not play else 1
+  cfg.episode_length_s = 12.0 if not play else int(1e9)
   return cfg
