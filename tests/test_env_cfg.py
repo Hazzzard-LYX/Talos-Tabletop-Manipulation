@@ -240,5 +240,8 @@ def test_stable_contact_lift_is_single_stage_and_checkpoint_compatible() -> None
     "collision_obstacle_boxes_b"
   ].params
   assert cfg.rewards["contact_lift_progress"].weight == 40.0
+  assert cfg.rewards["contact_lift_hold"].weight == 12.0
+  assert cfg.rewards["contact_lift_hold"].params["target_lift_height"] == 0.06
+  assert cfg.rewards["contact_lift_hold"].params["minimum_contact_links"] == 2
   assert cfg.rewards["contact_lift_success"].weight == 80.0
   assert cfg.rewards["lift_progress"].weight == 0.0

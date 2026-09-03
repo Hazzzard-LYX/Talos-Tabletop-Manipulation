@@ -149,6 +149,42 @@ def test_cube_tilt_does_not_count_as_airborne_lift() -> None:
   assert effective_lift.item() == pytest.approx(0.05, abs=1.0e-6)
 
 
+def test_contact_lift_hold_requires_airborne_height_and_distinct_links(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  obj = SimpleNamespace(
+    data=SimpleNamespace(
+      root_link_pos_w=torch.tensor([[0.0, 0.0, 0.952]]),
+      root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+    )
+  )
+  env = SimpleNamespace(
+    scene=_Scene(object=obj, contact=object()),
+    extras={"log": {}},
+  )
+  enough_links = torch.tensor([True])
+  monkeypatch.setattr(
+    reward_functions,
+    "_contact_link_mask",
+    lambda sensor, minimum_links: enough_links,
+  )
+  params = {
+    "initial_center_height": 0.89,
+    "table_height": 0.86,
+    "target_lift_height": 0.06,
+    "sensor_name": "contact",
+    "minimum_contact_links": 2,
+    "object_half_extents": (0.03, 0.03, 0.03),
+  }
+
+  assert mdp.contact_verified_lift_hold(env, **params).item() == pytest.approx(1.0)
+  enough_links[0] = False
+  assert mdp.contact_verified_lift_hold(env, **params).item() == 0.0
+  enough_links[0] = True
+  obj.data.root_link_pos_w[0, 2] = 0.89
+  assert mdp.contact_verified_lift_hold(env, **params).item() == 0.0
+
+
 def test_excessive_height_penalty_starts_above_thirty_centimeters() -> None:
   obj = SimpleNamespace(
     data=SimpleNamespace(root_link_pos_w=torch.tensor([[0.0, 0.0, 1.19]]))

@@ -1630,6 +1630,19 @@ def talos_tabletop_stable_contact_lift_env_cfg(
       "object_half_extents": CUBE_HALF_SIZE_M,
     },
   )
+  cfg.rewards["contact_lift_hold"] = RewardTermCfg(
+    func=mdp.contact_verified_lift_hold,
+    weight=12.0,
+    params={
+      "initial_center_height": initial_center_height,
+      "table_height": TABLE_TOP_HEIGHT_M,
+      "target_lift_height": 0.06,
+      "sensor_name": "right_gripper_object_contact",
+      "minimum_contact_links": 2,
+      "object_half_extents": CUBE_HALF_SIZE_M,
+      "exponent": 2.0,
+    },
+  )
   cfg.rewards["contact_lift_success"] = RewardTermCfg(
     func=mdp.sustained_verified_pick_success,
     weight=80.0,

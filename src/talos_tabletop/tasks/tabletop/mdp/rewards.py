@@ -713,6 +713,52 @@ class object_lift_record_progress:
     self._best[env_ids] = 0.0
 
 
+def contact_verified_lift_hold(
+  env: ManagerBasedRlEnv,
+  initial_center_height: float,
+  table_height: float,
+  target_lift_height: float,
+  sensor_name: str,
+  minimum_contact_links: int,
+  object_half_extents: tuple[float, float, float] | None = None,
+  sphere_radius: float | None = None,
+  clearance_margin: float = 0.002,
+  exponent: float = 2.0,
+  object_cfg: SceneEntityCfg = _DEFAULT_OBJECT_CFG,
+) -> torch.Tensor:
+  """Continuously reward holding an airborne object with multi-link contact.
+
+  Unlike the record-progress and one-shot success terms, this term is paid on
+  every control step.  It immediately becomes zero if the object loses true
+  bottom clearance or if contact drops below the requested number of distinct
+  hand links, so releasing an object cannot preserve previously earned hold
+  reward.
+  """
+  obj: Entity = env.scene[object_cfg.name]
+  center_lift, clearance, effective_lift = _object_lift_state(
+    obj,
+    initial_center_height,
+    table_height,
+    object_half_extents,
+    sphere_radius,
+    clearance_margin,
+  )
+  sensor = env.scene[sensor_name]
+  link_gate = _contact_link_mask(sensor, minimum_contact_links).float()
+  height_quality = (
+    (effective_lift / target_lift_height).clamp(min=0.0, max=1.0).pow(exponent)
+  )
+  hold_quality = height_quality * link_gate
+  env.extras["log"]["Metrics/contact_lift_hold_quality"] = hold_quality.mean()
+  env.extras["log"]["Metrics/contact_lift_hold_height_quality"] = (
+    height_quality.mean()
+  )
+  env.extras["log"]["Metrics/contact_lift_hold_link_gate"] = link_gate.mean()
+  env.extras["log"]["Metrics/object_com_lift_height_m"] = center_lift.mean()
+  env.extras["log"]["Metrics/object_bottom_clearance_m"] = clearance.mean()
+  return hold_quality
+
+
 def _contact_link_mask(
   sensor: ContactSensor,
   minimum_contact_links: int,
