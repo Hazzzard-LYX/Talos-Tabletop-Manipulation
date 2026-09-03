@@ -3,9 +3,12 @@ import math
 import pytest
 import torch
 from talos_tabletop.tasks.tabletop.mdp.reverse_curriculum import (
+  DEFAULT_REVERSE_CURRICULUM_STAGES,
   GRASP_DIFFICULTY_COMPONENT_NAMES,
   GraspStateDifficultyLimits,
   GraspStateFeatures,
+  assess_reverse_curriculum_promotion,
+  build_reverse_curriculum_stage_definitions,
   classify_grasp_state,
 )
 
@@ -142,3 +145,73 @@ def test_invalid_secondary_weight_is_rejected() -> None:
       _features(1),
       limits=GraspStateDifficultyLimits(secondary_difficulty_weight=1.01),
     )
+
+
+def test_reverse_curriculum_defines_all_twenty_training_stages() -> None:
+  assert tuple(stage.stage for stage in DEFAULT_REVERSE_CURRICULUM_STAGES) == tuple(
+    range(1, 21)
+  )
+
+  for definition in DEFAULT_REVERSE_CURRICULUM_STAGES[:-1]:
+    stage = definition.stage
+    assert definition.initialization_mixture == (
+      (stage - 1, 0.30),
+      (stage, 0.60),
+      (stage + 1, 0.10),
+    )
+    assert sum(probability for _, probability in definition.initialization_mixture) == (
+      pytest.approx(1.0)
+    )
+    assert definition.promotion_success_rate == pytest.approx(0.80)
+    assert definition.promotion_evaluation_stage == stage
+    assert definition.evaluation_episodes == 4096
+    assert definition.success_hold_duration_s == pytest.approx(5.0)
+    assert definition.success_lift_height_m == pytest.approx(0.06)
+
+
+def test_final_stage_uses_seventy_thirty_mixture_without_promotion() -> None:
+  definition = DEFAULT_REVERSE_CURRICULUM_STAGES[-1]
+  assert definition.initialization_mixture == ((19, 0.30), (20, 0.70))
+  assert definition.promotion_success_rate is None
+  assert definition.promotion_evaluation_stage is None
+  assert definition.evaluation_episodes is None
+
+
+def test_promotion_requires_more_than_eighty_percent_in_full_window() -> None:
+  definition = build_reverse_curriculum_stage_definitions(
+    evaluation_episodes=100
+  )[4]
+
+  success_rate, ready = assess_reverse_curriculum_promotion(
+    successful_current_stage_episodes=80,
+    completed_current_stage_episodes=100,
+    definition=definition,
+  )
+  assert success_rate == pytest.approx(0.80)
+  assert ready is False
+
+  success_rate, ready = assess_reverse_curriculum_promotion(
+    successful_current_stage_episodes=81,
+    completed_current_stage_episodes=100,
+    definition=definition,
+  )
+  assert success_rate == pytest.approx(0.81)
+  assert ready is True
+
+
+def test_easier_and_harder_replay_do_not_enter_promotion_rate() -> None:
+  definition = build_reverse_curriculum_stage_definitions(
+    evaluation_episodes=10
+  )[9]
+  assert definition.promotion_evaluation_stage == 10
+  assert definition.initialization_probability(9) == pytest.approx(0.30)
+  assert definition.initialization_probability(10) == pytest.approx(0.60)
+  assert definition.initialization_probability(11) == pytest.approx(0.10)
+  assert definition.initialization_probability(12) == pytest.approx(0.0)
+
+  _, ready = assess_reverse_curriculum_promotion(
+    successful_current_stage_episodes=8,
+    completed_current_stage_episodes=10,
+    definition=definition,
+  )
+  assert ready is False

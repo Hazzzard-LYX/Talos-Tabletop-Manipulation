@@ -31,6 +31,130 @@ GRASP_DIFFICULTY_COMPONENT_NAMES = (
 # calibrated against empirical finite-horizon grasp success probability.
 DEFAULT_GRASP_STAGE_BOUNDARIES = tuple(index / 20.0 for index in range(1, 20))
 
+REVERSE_CURRICULUM_FIRST_STAGE = 1
+REVERSE_CURRICULUM_FINAL_STAGE = 20
+DEFAULT_REVERSE_CURRICULUM_PROMOTION_SUCCESS_RATE = 0.80
+DEFAULT_REVERSE_CURRICULUM_EVALUATION_EPISODES = 4096
+DEFAULT_REVERSE_CURRICULUM_SUCCESS_HOLD_DURATION_S = 5.0
+DEFAULT_REVERSE_CURRICULUM_SUCCESS_LIFT_HEIGHT_M = 0.06
+
+
+@dataclass(frozen=True)
+class ReverseCurriculumStageDefinition:
+  """Initialization mixture and promotion target for one curriculum stage.
+
+  Difficulty indices increase from the verified-grasp seed at Stage 0 toward
+  the hardest classified standing states at Stage 20. Promotion statistics
+  use only episodes initialized from ``promotion_evaluation_stage``; easier
+  replay and harder exploratory samples cannot bias the gate.
+  """
+
+  stage: int
+  initialization_mixture: tuple[tuple[int, float], ...]
+  success_hold_duration_s: float
+  success_lift_height_m: float
+  promotion_success_rate: float | None
+  promotion_evaluation_stage: int | None
+  evaluation_episodes: int | None
+
+  def initialization_probability(self, difficulty_stage: int) -> float:
+    """Return the reset probability assigned to one difficulty stage."""
+    return next(
+      (
+        probability
+        for candidate_stage, probability in self.initialization_mixture
+        if candidate_stage == difficulty_stage
+      ),
+      0.0,
+    )
+
+
+def build_reverse_curriculum_stage_definitions(
+  *,
+  promotion_success_rate: float = (
+    DEFAULT_REVERSE_CURRICULUM_PROMOTION_SUCCESS_RATE
+  ),
+  evaluation_episodes: int = DEFAULT_REVERSE_CURRICULUM_EVALUATION_EPISODES,
+  success_hold_duration_s: float = (
+    DEFAULT_REVERSE_CURRICULUM_SUCCESS_HOLD_DURATION_S
+  ),
+  success_lift_height_m: float = DEFAULT_REVERSE_CURRICULUM_SUCCESS_LIFT_HEIGHT_M,
+) -> tuple[ReverseCurriculumStageDefinition, ...]:
+  """Build Stage 1--20 without a hard switch between difficulty regions."""
+  if not 0.0 < promotion_success_rate < 1.0:
+    raise ValueError("Promotion success rate must lie strictly inside (0, 1).")
+  if evaluation_episodes <= 0:
+    raise ValueError("Evaluation episodes must be positive.")
+  if success_hold_duration_s <= 0.0:
+    raise ValueError("Success hold duration must be positive.")
+  if success_lift_height_m <= 0.0:
+    raise ValueError("Success lift height must be positive.")
+
+  definitions = []
+  for stage in range(
+    REVERSE_CURRICULUM_FIRST_STAGE,
+    REVERSE_CURRICULUM_FINAL_STAGE + 1,
+  ):
+    if stage < REVERSE_CURRICULUM_FINAL_STAGE:
+      mixture = ((stage - 1, 0.30), (stage, 0.60), (stage + 1, 0.10))
+      required_rate: float | None = promotion_success_rate
+      promotion_evaluation_stage: int | None = stage
+      required_episodes: int | None = evaluation_episodes
+    else:
+      mixture = ((stage - 1, 0.30), (stage, 0.70))
+      required_rate = None
+      promotion_evaluation_stage = None
+      required_episodes = None
+
+    definitions.append(
+      ReverseCurriculumStageDefinition(
+        stage=stage,
+        initialization_mixture=mixture,
+        success_hold_duration_s=success_hold_duration_s,
+        success_lift_height_m=success_lift_height_m,
+        promotion_success_rate=required_rate,
+        promotion_evaluation_stage=promotion_evaluation_stage,
+        evaluation_episodes=required_episodes,
+      )
+    )
+  return tuple(definitions)
+
+
+DEFAULT_REVERSE_CURRICULUM_STAGES = build_reverse_curriculum_stage_definitions()
+
+
+def assess_reverse_curriculum_promotion(
+  *,
+  successful_current_stage_episodes: int,
+  completed_current_stage_episodes: int,
+  definition: ReverseCurriculumStageDefinition,
+) -> tuple[float, bool]:
+  """Return current-bin success rate and whether the next stage may open.
+
+  The comparison is intentionally strict: exactly 80% does not satisfy a
+  requirement that success probability be greater than 80%.
+  """
+  if completed_current_stage_episodes < 0:
+    raise ValueError("Completed episode count cannot be negative.")
+  if not 0 <= successful_current_stage_episodes <= completed_current_stage_episodes:
+    raise ValueError("Successful episodes must be within the completed count.")
+
+  success_rate = (
+    successful_current_stage_episodes / completed_current_stage_episodes
+    if completed_current_stage_episodes > 0
+    else 0.0
+  )
+  if (
+    definition.promotion_success_rate is None
+    or definition.evaluation_episodes is None
+  ):
+    return success_rate, False
+  ready = (
+    completed_current_stage_episodes >= definition.evaluation_episodes
+    and success_rate > definition.promotion_success_rate
+  )
+  return success_rate, ready
+
 
 @dataclass(frozen=True)
 class GraspStateFeatures:
