@@ -59,14 +59,10 @@ TRAIN_ARGS=(
   --log-root "${RUN_ROOT}"
 )
 
-if [[ "${INITIAL_STAGE}" != "0" ]]; then
-  TRAIN_ARGS+=(
-)
-if [[ "${INITIAL_STAGE}" != "none" ]]; then
+if [[ "${INITIAL_STAGE}" != "0" && "${INITIAL_STAGE}" != "none" ]]; then
   TRAIN_ARGS+=(
     --env.curriculum.task-stage.params.initial-stage "${INITIAL_STAGE}"
   )
-fi
 fi
 
 if [[ -n "${RESUME_CHECKPOINT_PATH}" || -n "${INIT_CHECKPOINT_PATH}" ]]; then
