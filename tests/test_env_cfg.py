@@ -11,6 +11,7 @@ from talos_tabletop.tasks.tabletop.env_cfg import (
   talos_tabletop_grasp_env_cfg,
   talos_tabletop_position_tracking_env_cfg,
   talos_tabletop_reaching_env_cfg,
+  talos_tabletop_stable_contact_lift_env_cfg,
   talos_tabletop_stationary_grasp_env_cfg,
 )
 
@@ -217,7 +218,44 @@ def test_stationary_grasp_task_has_verified_pick_curriculum() -> None:
   assert cfg.observations["actor"].terms[
     "privileged_object_center_b"
   ].params["minimum_curriculum_stage"] == 1
-  assert cfg.scene.sensors[0].fields == ("found", "force", "pos", "normal")
+  assert cfg.scene.sensors[0].fields == (
+    "found",
+    "force",
+    "pos",
+    "normal",
+    "tangent",
+  )
+  assert cfg.scene.sensors[0].global_frame is True
   assert cfg.scene.sensors[0].track_air_time is True
   assert cfg.rewards["low_lift_success"].params["required_duration_s"] == 0.50
   assert cfg.rewards["grasp_lift_success"].params["required_duration_s"] == 1.0
+
+
+def test_stable_contact_lift_is_single_stage_and_checkpoint_compatible() -> None:
+  cfg = talos_tabletop_stable_contact_lift_env_cfg()
+
+  assert cfg.curriculum == {}
+  assert cfg.scene.num_envs == 2048
+  assert cfg.events["reset_object_on_pickup_zone"].params["pose_range"] == {}
+  assert cfg.scene.entities["robot"].init_state.joint_pos[
+    "gripper_right_joint"
+  ] == pytest.approx(-0.7306)
+  assert cfg.observations["actor"].terms[
+    "privileged_object_center_b"
+  ].params == {}
+  assert "minimum_curriculum_stage" not in cfg.observations["actor"].terms[
+    "collision_obstacle_boxes_b"
+  ].params
+  assert cfg.scene.entities["object"].init_state.pos[2] == pytest.approx(0.97)
+  assert cfg.rewards["contact_lift_progress"].weight == 6.0
+  assert cfg.rewards["contact_lift_progress"].func.__name__ == (
+    "contact_verified_lift_height"
+  )
+  assert cfg.rewards["contact_height_target"].weight == 20.0
+  assert cfg.rewards["contact_height_target"].params["target_lift_height"] == 0.08
+  assert cfg.rewards["contact_height_target"].params["height_error_std"] == 0.025
+  assert cfg.rewards["force_closure"].weight == 4.0
+  assert cfg.rewards["contact_lift_success"].weight == 80.0
+  assert cfg.rewards["contact_lift_success"].params["required_duration_s"] == 5.0
+  assert cfg.rewards["contact_lift_success"].params["maximum_height_error"] == 0.015
+  assert cfg.rewards["lift_progress"].weight == 0.0

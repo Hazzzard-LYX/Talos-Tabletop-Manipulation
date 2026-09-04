@@ -59,3 +59,29 @@ def test_checkpoint_migration_appends_zero_initialized_phase_columns(
   assert migrated["iter"] == 0
   assert migrated["infos"] == {}
   assert "optimizer_state_dict" not in migrated
+
+
+def test_checkpoint_migration_can_strip_training_state_without_expansion(
+  tmp_path: Path,
+) -> None:
+  source = tmp_path / "source.pt"
+  destination = tmp_path / "weights_only.pt"
+  actor = _model_state(222, 29)
+  critic = _model_state(225, 1)
+  torch.save(
+    {
+      "actor_state_dict": actor,
+      "critic_state_dict": critic,
+      "optimizer_state_dict": {"old": True},
+      "iter": 1100,
+    },
+    source,
+  )
+
+  migrate_checkpoint(source, destination, actor_added_dims=0, critic_added_dims=0)
+  migrated = torch.load(destination, weights_only=False)
+
+  assert migrated["actor_state_dict"]["mlp.0.weight"].shape == (4, 222)
+  assert migrated["critic_state_dict"]["mlp.0.weight"].shape == (4, 225)
+  assert migrated["iter"] == 0
+  assert "optimizer_state_dict" not in migrated
