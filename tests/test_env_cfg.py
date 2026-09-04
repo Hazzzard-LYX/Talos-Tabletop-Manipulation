@@ -8,6 +8,7 @@ from talos_tabletop.tasks.tabletop.env_cfg import (
   MAX_COLLISION_OBSTACLES,
   ROBOT_SPAWN_POSITION_M,
   STATIONARY_GRASP_ROBOT_POSITION_M,
+  talos_tabletop_anchor_standing_env_cfg,
   talos_tabletop_grasp_env_cfg,
   talos_tabletop_position_tracking_env_cfg,
   talos_tabletop_reaching_env_cfg,
@@ -164,9 +165,10 @@ def test_position_tracking_task_stops_before_manipulation_mode() -> None:
   assert gait_weights["reach_table_success"] == 0.0
   assert tracking_weights["reach_table_success"] == 10.0
   assert tracking_weights["approach_object"] == 0.0
-  assert cfg.observations["actor"].terms["locomotion_phase"].params[
-    "control_mode"
-  ] == "position_tracking"
+  assert (
+    cfg.observations["actor"].terms["locomotion_phase"].params["control_mode"]
+    == "position_tracking"
+  )
 
 
 def test_stationary_grasp_task_has_verified_pick_curriculum() -> None:
@@ -212,12 +214,16 @@ def test_stationary_grasp_task_has_verified_pick_curriculum() -> None:
   assert len(params["stage_termination_params"]) == 4
   assert cfg.rewards["standing_success"].params["maximum_linear_speed"] == 0.05
   assert cfg.rewards["standing_success"].params["maximum_angular_speed"] == 0.10
-  assert cfg.observations["actor"].terms["locomotion_phase"].params[
-    "control_mode"
-  ] == "manipulation"
-  assert cfg.observations["actor"].terms[
-    "privileged_object_center_b"
-  ].params["minimum_curriculum_stage"] == 1
+  assert (
+    cfg.observations["actor"].terms["locomotion_phase"].params["control_mode"]
+    == "manipulation"
+  )
+  assert (
+    cfg.observations["actor"]
+    .terms["privileged_object_center_b"]
+    .params["minimum_curriculum_stage"]
+    == 1
+  )
   assert cfg.scene.sensors[0].fields == (
     "found",
     "force",
@@ -240,12 +246,11 @@ def test_stable_contact_lift_is_single_stage_and_checkpoint_compatible() -> None
   assert cfg.scene.entities["robot"].init_state.joint_pos[
     "gripper_right_joint"
   ] == pytest.approx(-0.7306)
-  assert cfg.observations["actor"].terms[
-    "privileged_object_center_b"
-  ].params == {}
-  assert "minimum_curriculum_stage" not in cfg.observations["actor"].terms[
-    "collision_obstacle_boxes_b"
-  ].params
+  assert cfg.observations["actor"].terms["privileged_object_center_b"].params == {}
+  assert (
+    "minimum_curriculum_stage"
+    not in cfg.observations["actor"].terms["collision_obstacle_boxes_b"].params
+  )
   assert cfg.scene.entities["object"].init_state.pos[2] == pytest.approx(0.97)
   assert cfg.rewards["contact_lift_progress"].weight == 6.0
   assert cfg.rewards["contact_lift_progress"].func.__name__ == (
@@ -259,3 +264,59 @@ def test_stable_contact_lift_is_single_stage_and_checkpoint_compatible() -> None
   assert cfg.rewards["contact_lift_success"].params["required_duration_s"] == 5.0
   assert cfg.rewards["contact_lift_success"].params["maximum_height_error"] == 0.015
   assert cfg.rewards["lift_progress"].weight == 0.0
+
+
+def test_anchor_standing_uses_three_performance_gated_dr_levels(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  anchor_path = "/tmp/test-standing-anchors.pt"
+  monkeypatch.setenv("TALOS_STANDING_ANCHOR_BANK", anchor_path)
+  cfg = talos_tabletop_anchor_standing_env_cfg()
+
+  assert cfg.scene.num_envs == 2048
+  assert cfg.episode_length_s == 10.0
+  assert cfg.events["push_robot"].interval_range_s == (6.0, 6.5)
+  assert "reset_robot_root" not in cfg.events
+  assert "reset_robot_joints" not in cfg.events
+  assert "reset_object_on_pickup_zone" not in cfg.events
+  assert cfg.events["reset_anchor_state"].params["anchor_bank_path"] == anchor_path
+  assert {
+    "reset_anchor_state",
+    "reset_frictionloss",
+    "reset_foot_friction",
+    "reset_pd_gains",
+    "reset_encoder_bias",
+    "push_robot",
+  } <= set(cfg.events)
+  assert cfg.rewards["standing_success"].weight == 10.0
+  assert cfg.rewards["standing_success"].params["required_duration_s"] == 5.0
+  assert cfg.rewards["standing_success"].params["maximum_linear_speed"] == 0.10
+  assert cfg.rewards["standing_success"].params["maximum_angular_speed"] == 0.20
+  assert cfg.rewards["contact_lift_success"].weight == 0.0
+  assert cfg.terminations["object_lost"].params["minimum_height"] == -10.0
+  assert "body_table_contact" not in cfg.terminations
+
+  params = cfg.curriculum["standing_randomization_stage"].params
+  assert len(params["stage_reward_weights"]) == 3
+  assert len(params["stage_event_params"]) == 3
+  assert params["promotion_reward_names"] == (
+    "standing_success",
+    "standing_success",
+  )
+  assert params["promotion_success_rates"] == (0.80, 0.80)
+  assert params["evaluation_episodes"] == (8192, 8192)
+  assert params["strict_promotion"] is True
+
+  stages = params["stage_event_params"]
+  assert stages[0]["reset_anchor_state"]["joint_position_range"] == (
+    -0.01,
+    0.01,
+  )
+  assert stages[2]["reset_anchor_state"]["joint_position_range"] == (
+    -0.06,
+    0.06,
+  )
+  assert stages[0]["reset_frictionloss"]["ranges"] == (0.80, 1.20)
+  assert stages[2]["reset_frictionloss"]["ranges"] == (0.25, 2.00)
+  assert stages[0]["push_robot"]["velocity_range"]["x"] == (-0.05, 0.05)
+  assert stages[2]["push_robot"]["velocity_range"]["x"] == (-0.30, 0.30)

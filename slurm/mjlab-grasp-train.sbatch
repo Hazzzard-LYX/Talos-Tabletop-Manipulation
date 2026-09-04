@@ -69,6 +69,7 @@ fi
 
 if [[ -n "${RESUME_CHECKPOINT_PATH}" || -n "${INIT_CHECKPOINT_PATH}" ]]; then
   case "${TASK}" in
+    *Anchor-Standing-Cube*) EXPERIMENT_NAME="talos_tabletop_anchor_standing_cube" ;;
     *Position-Tracking*) EXPERIMENT_NAME="talos_tabletop_position_tracking" ;;
     *Stable-Contact-Lift-Cube*) EXPERIMENT_NAME="talos_tabletop_stable_contact_lift_cube" ;;
     *Stationary-Grasp-Cube*) EXPERIMENT_NAME="talos_tabletop_stationary_grasp_cube" ;;

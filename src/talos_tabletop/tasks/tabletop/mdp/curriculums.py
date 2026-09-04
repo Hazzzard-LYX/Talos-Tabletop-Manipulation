@@ -29,6 +29,7 @@ class performance_stage_curriculum:
     self._promotion_reward_names: tuple[str, ...] = params["promotion_reward_names"]
     self._promotion_success_rates: tuple[float, ...] = params["promotion_success_rates"]
     self._evaluation_episodes: tuple[int, ...] = params["evaluation_episodes"]
+    self._strict_promotion = bool(params.get("strict_promotion", False))
     self._stage_termination_params: tuple[dict[str, dict[str, Any]], ...] = params.get(
       "stage_termination_params", tuple({} for _ in self._stage_reward_weights)
     )
@@ -90,6 +91,7 @@ class performance_stage_curriculum:
     stage_termination_params: tuple[dict[str, dict[str, Any]], ...],
     stage_event_params: tuple[dict[str, dict[str, Any]], ...] | None = None,
     initial_stage: int = 0,
+    strict_promotion: bool = False,
   ) -> dict[str, torch.Tensor]:
     del (
       stage_reward_weights,
@@ -99,6 +101,7 @@ class performance_stage_curriculum:
       stage_termination_params,
       stage_event_params,
       initial_stage,
+      strict_promotion,
     )
 
     if self.current_stage < len(self._promotion_reward_names):
@@ -114,7 +117,12 @@ class performance_stage_curriculum:
       if self._window_episodes >= required_episodes:
         self._last_success_rate = self._window_successes / self._window_episodes
         required_rate = self._promotion_success_rates[self.current_stage]
-        if self._last_success_rate >= required_rate:
+        promoted = (
+          self._last_success_rate > required_rate
+          if self._strict_promotion
+          else self._last_success_rate >= required_rate
+        )
+        if promoted:
           self.current_stage += 1
           self._apply_stage()
           # Stage changes can alter the physical scene (for example, restoring

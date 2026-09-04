@@ -1,6 +1,7 @@
 """TALOS tabletop reaching and privileged-position grasping tasks."""
 
 import math
+import os
 from typing import Literal
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -690,17 +691,11 @@ def talos_tabletop_grasp_env_cfg(
   cfg.scene.sensors = (right_contact, feet_ground, body_ground, body_table)
 
   lower_body = SceneEntityCfg("robot", joint_names=(r"leg_.*_joint",))
-  lower_body_lateral = SceneEntityCfg(
-    "robot", joint_names=(r"leg_.*_(1|2)_joint",)
-  )
-  foot_sites = SceneEntityCfg(
-    "robot", site_names=("left_foot", "right_foot")
-  )
+  lower_body_lateral = SceneEntityCfg("robot", joint_names=(r"leg_.*_(1|2)_joint",))
+  foot_sites = SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))
   left_arm = SceneEntityCfg("robot", joint_names=(r"arm_left_.*_joint",))
   right_arm = SceneEntityCfg("robot", joint_names=(r"arm_right_.*_joint",))
-  right_gripper_joint = SceneEntityCfg(
-    "robot", joint_names=(r"gripper_right_joint",)
-  )
+  right_gripper_joint = SceneEntityCfg("robot", joint_names=(r"gripper_right_joint",))
   cfg.rewards = {
     "upright": RewardTermCfg(
       func=mdp.upright,
@@ -1500,21 +1495,15 @@ def talos_tabletop_stationary_grasp_env_cfg(
           },
           {
             "reset_table_root": {"pose_range": {}},
-            "reset_object_on_pickup_zone": {
-              "pose_range": active_object_pose_range
-            },
+            "reset_object_on_pickup_zone": {"pose_range": active_object_pose_range},
           },
           {
             "reset_table_root": {"pose_range": {}},
-            "reset_object_on_pickup_zone": {
-              "pose_range": active_object_pose_range
-            },
+            "reset_object_on_pickup_zone": {"pose_range": active_object_pose_range},
           },
           {
             "reset_table_root": {"pose_range": {}},
-            "reset_object_on_pickup_zone": {
-              "pose_range": active_object_pose_range
-            },
+            "reset_object_on_pickup_zone": {"pose_range": active_object_pose_range},
           },
         ),
       },
@@ -1674,9 +1663,348 @@ def talos_tabletop_stable_contact_lift_env_cfg(
       "clearance_margin": 0.0,
     },
   )
-  cfg.terminations["object_lost"].params["minimum_height"] = (
-    TABLE_TOP_HEIGHT_M - 0.12
-  )
+  cfg.terminations["object_lost"].params["minimum_height"] = TABLE_TOP_HEIGHT_M - 0.12
   cfg.scene.num_envs = 2048 if not play else 1
   cfg.episode_length_s = 12.0 if not play else int(1e9)
+  return cfg
+
+
+def talos_tabletop_anchor_standing_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Train robust standing from the complete 20-stage IK anchor distribution."""
+  cfg = talos_tabletop_stable_contact_lift_env_cfg(play=play)
+  anchor_bank_path = os.environ.get("TALOS_STANDING_ANCHOR_BANK", "")
+
+  # Standing is the only objective here.  Contact/lift terms remain registered
+  # to preserve the 222/225 observation and 29-action checkpoint interface, but
+  # cannot influence this pretraining policy.
+  standing_weights = {name: 0.0 for name in cfg.rewards}
+  standing_weights.update(
+    {
+      "termination_penalty": -200.0,
+      "dof_pos_limits": -1.0,
+      "action_magnitude_l2": -0.01,
+      "action_rate_l2": -0.02,
+      "joint_vel_hinge": -0.02,
+      "upright": 4.0,
+      "both_feet_contact": 2.0,
+      "standing_success": 10.0,
+      "base_motion": -1.0,
+      "base_drift": -4.0,
+      "foot_slip": -0.5,
+      "lower_body_pose": -0.5,
+      "lower_body_lateral_pose": -0.5,
+      "left_arm_pose": -0.1,
+      "right_arm_pose": -0.02,
+    }
+  )
+  for reward_name, weight in standing_weights.items():
+    cfg.rewards[reward_name].weight = weight
+  # The stationary-grasp task's 0.05/0.10 speed gate is appropriate for
+  # deterministic evaluation but rejects harmless balance motion under PPO's
+  # stochastic exploration.  These measured thresholds retain a strict
+  # five-second, two-feet, upright test while making the training success rate
+  # representative (model_200: 84.4% deterministic on Stage-0 DR).
+  cfg.rewards["standing_success"].params.update(
+    {
+      "maximum_linear_speed": 0.10,
+      "maximum_angular_speed": 0.20,
+    }
+  )
+  cfg.terminations["object_lost"].params["minimum_height"] = -10.0
+  # The generated manipulation anchors intentionally place the arm/hand close
+  # to the tabletop.  Table contact is therefore diagnostic, not evidence that
+  # the balance policy failed; only falling/ground contacts terminate standing.
+  cfg.terminations.pop("body_table_contact", None)
+
+  controlled_joints = SceneEntityCfg(
+    "robot",
+    joint_names=(
+      r"leg_.*_joint",
+      r"torso_.*_joint",
+      r"arm_.*_joint",
+      r"gripper_right_joint",
+    ),
+  )
+  # MJLab's PD randomizer indexes actuator *groups*, whereas actuator-name
+  # resolution returns individual control indices.  Randomizing all TALOS
+  # groups is both physically appropriate and avoids mixing those namespaces.
+  controlled_actuators = SceneEntityCfg("robot")
+
+  # The anchor event atomically replaces the independent root/joint/object
+  # resets inherited from the manipulation task.
+  cfg.events.pop("reset_robot_root", None)
+  cfg.events.pop("reset_robot_joints", None)
+  cfg.events.pop("reset_object_on_pickup_zone", None)
+  cfg.events["reset_foot_friction"] = EventTermCfg(
+    mode="reset",
+    func=dr.geom_friction,
+    params={
+      "asset_cfg": SceneEntityCfg(
+        "robot",
+        geom_names=(r"left_foot_collision", r"right_foot_collision"),
+      ),
+      "ranges": (0.70, 1.20),
+      "operation": "abs",
+      "axes": [0],
+      "shared_random": True,
+    },
+  )
+  cfg.events["reset_pd_gains"] = EventTermCfg(
+    mode="reset",
+    func=dr.pd_gains,
+    params={
+      "asset_cfg": controlled_actuators,
+      "kp_range": (0.95, 1.05),
+      "kd_range": (0.95, 1.05),
+      "operation": "scale",
+    },
+  )
+  cfg.events["reset_encoder_bias"] = EventTermCfg(
+    mode="reset",
+    func=dr.encoder_bias,
+    params={
+      "asset_cfg": controlled_joints,
+      "bias_range": (-0.002, 0.002),
+    },
+  )
+  cfg.events["reset_anchor_state"] = EventTermCfg(
+    mode="reset",
+    func=mdp.reset_from_anchor_bank,
+    params={
+      "anchor_bank_path": anchor_bank_path,
+      "joint_position_range": (-0.01, 0.01),
+      "joint_velocity_range": (-0.02, 0.02),
+      "root_pose_range": {
+        "x": (-0.003, 0.003),
+        "y": (-0.003, 0.003),
+        "roll": (-math.radians(0.5), math.radians(0.5)),
+        "pitch": (-math.radians(0.5), math.radians(0.5)),
+        "yaw": (-math.radians(1.0), math.radians(1.0)),
+      },
+      "root_velocity_range": {
+        "x": (-0.02, 0.02),
+        "y": (-0.02, 0.02),
+        "z": (-0.02, 0.02),
+        "roll": (-0.03, 0.03),
+        "pitch": (-0.03, 0.03),
+        "yaw": (-0.03, 0.03),
+      },
+      "object_pose_range": {
+        "x": (-0.002, 0.002),
+        "y": (-0.002, 0.002),
+        "z": (-0.002, 0.002),
+        "roll": (-math.radians(1.0), math.radians(1.0)),
+        "pitch": (-math.radians(1.0), math.radians(1.0)),
+        "yaw": (-math.radians(1.0), math.radians(1.0)),
+      },
+      "object_velocity_range": {
+        axis: (-0.01, 0.01) for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+      },
+      "robot_cfg": SceneEntityCfg("robot"),
+      "object_cfg": SceneEntityCfg("object"),
+    },
+  )
+  cfg.events["push_robot"] = EventTermCfg(
+    mode="interval",
+    # The sparse success reward requires five uninterrupted stable seconds.
+    # Schedule exactly one push after that evaluation interval so recovery is
+    # still trained without making curriculum promotion logically impossible.
+    interval_range_s=(6.0, 6.5),
+    is_global_time=False,
+    func=mdp.push_by_setting_velocity,
+    params={
+      "asset_cfg": SceneEntityCfg("robot"),
+      "velocity_range": {
+        "x": (-0.05, 0.05),
+        "y": (-0.05, 0.05),
+        "z": (-0.02, 0.02),
+        "roll": (-0.05, 0.05),
+        "pitch": (-0.05, 0.05),
+        "yaw": (-0.05, 0.05),
+      },
+    },
+  )
+
+  anchor_ranges = (
+    {
+      "joint_position_range": (-0.01, 0.01),
+      "joint_velocity_range": (-0.02, 0.02),
+      "root_pose_range": {
+        "x": (-0.003, 0.003),
+        "y": (-0.003, 0.003),
+        "roll": (-math.radians(0.5), math.radians(0.5)),
+        "pitch": (-math.radians(0.5), math.radians(0.5)),
+        "yaw": (-math.radians(1.0), math.radians(1.0)),
+      },
+      "root_velocity_range": {
+        axis: (-value, value)
+        for axis, value in {
+          "x": 0.02,
+          "y": 0.02,
+          "z": 0.02,
+          "roll": 0.03,
+          "pitch": 0.03,
+          "yaw": 0.03,
+        }.items()
+      },
+      "object_pose_range": {
+        "x": (-0.002, 0.002),
+        "y": (-0.002, 0.002),
+        "z": (-0.002, 0.002),
+        "roll": (-math.radians(1.0), math.radians(1.0)),
+        "pitch": (-math.radians(1.0), math.radians(1.0)),
+        "yaw": (-math.radians(1.0), math.radians(1.0)),
+      },
+      "object_velocity_range": {
+        axis: (-0.01, 0.01) for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+      },
+    },
+    {
+      "joint_position_range": (-0.03, 0.03),
+      "joint_velocity_range": (-0.08, 0.08),
+      "root_pose_range": {
+        "x": (-0.01, 0.01),
+        "y": (-0.01, 0.01),
+        "roll": (-math.radians(2.0), math.radians(2.0)),
+        "pitch": (-math.radians(2.0), math.radians(2.0)),
+        "yaw": (-math.radians(3.0), math.radians(3.0)),
+      },
+      "root_velocity_range": {
+        axis: (-value, value)
+        for axis, value in {
+          "x": 0.08,
+          "y": 0.08,
+          "z": 0.08,
+          "roll": 0.15,
+          "pitch": 0.15,
+          "yaw": 0.15,
+        }.items()
+      },
+      "object_pose_range": {
+        "x": (-0.008, 0.008),
+        "y": (-0.008, 0.008),
+        "z": (-0.008, 0.008),
+        "roll": (-math.radians(3.0), math.radians(3.0)),
+        "pitch": (-math.radians(3.0), math.radians(3.0)),
+        "yaw": (-math.radians(3.0), math.radians(3.0)),
+      },
+      "object_velocity_range": {
+        axis: (-0.04, 0.04) for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+      },
+    },
+    {
+      "joint_position_range": (-0.06, 0.06),
+      "joint_velocity_range": (-0.15, 0.15),
+      "root_pose_range": {
+        "x": (-0.02, 0.02),
+        "y": (-0.02, 0.02),
+        "roll": (-math.radians(4.0), math.radians(4.0)),
+        "pitch": (-math.radians(4.0), math.radians(4.0)),
+        "yaw": (-math.radians(6.0), math.radians(6.0)),
+      },
+      "root_velocity_range": {
+        axis: (-value, value)
+        for axis, value in {
+          "x": 0.15,
+          "y": 0.15,
+          "z": 0.15,
+          "roll": 0.30,
+          "pitch": 0.30,
+          "yaw": 0.30,
+        }.items()
+      },
+      "object_pose_range": {
+        "x": (-0.015, 0.015),
+        "y": (-0.015, 0.015),
+        "z": (-0.015, 0.015),
+        "roll": (-math.radians(6.0), math.radians(6.0)),
+        "pitch": (-math.radians(6.0), math.radians(6.0)),
+        "yaw": (-math.radians(6.0), math.radians(6.0)),
+      },
+      "object_velocity_range": {
+        axis: (-0.08, 0.08) for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+      },
+    },
+  )
+  stage_event_params = (
+    {
+      "reset_anchor_state": anchor_ranges[0],
+      "reset_frictionloss": {"ranges": (0.80, 1.20)},
+      "reset_foot_friction": {"ranges": (0.70, 1.20)},
+      "reset_pd_gains": {"kp_range": (0.95, 1.05), "kd_range": (0.95, 1.05)},
+      "reset_encoder_bias": {"bias_range": (-0.002, 0.002)},
+      "push_robot": {
+        "velocity_range": {
+          axis: (-value, value)
+          for axis, value in {
+            "x": 0.05,
+            "y": 0.05,
+            "z": 0.02,
+            "roll": 0.05,
+            "pitch": 0.05,
+            "yaw": 0.05,
+          }.items()
+        }
+      },
+    },
+    {
+      "reset_anchor_state": anchor_ranges[1],
+      "reset_frictionloss": {"ranges": (0.50, 1.50)},
+      "reset_foot_friction": {"ranges": (0.50, 1.30)},
+      "reset_pd_gains": {"kp_range": (0.85, 1.15), "kd_range": (0.85, 1.15)},
+      "reset_encoder_bias": {"bias_range": (-0.005, 0.005)},
+      "push_robot": {
+        "velocity_range": {
+          axis: (-value, value)
+          for axis, value in {
+            "x": 0.15,
+            "y": 0.15,
+            "z": 0.05,
+            "roll": 0.20,
+            "pitch": 0.20,
+            "yaw": 0.20,
+          }.items()
+        }
+      },
+    },
+    {
+      "reset_anchor_state": anchor_ranges[2],
+      "reset_frictionloss": {"ranges": (0.25, 2.00)},
+      "reset_foot_friction": {"ranges": (0.35, 1.50)},
+      "reset_pd_gains": {"kp_range": (0.70, 1.30), "kd_range": (0.70, 1.30)},
+      "reset_encoder_bias": {"bias_range": (-0.010, 0.010)},
+      "push_robot": {
+        "velocity_range": {
+          axis: (-value, value)
+          for axis, value in {
+            "x": 0.30,
+            "y": 0.30,
+            "z": 0.10,
+            "roll": 0.40,
+            "pitch": 0.40,
+            "yaw": 0.40,
+          }.items()
+        }
+      },
+    },
+  )
+  cfg.curriculum = {
+    "standing_randomization_stage": CurriculumTermCfg(
+      func=mdp.performance_stage_curriculum,
+      params={
+        "stage_reward_weights": tuple(dict(standing_weights) for _ in range(3)),
+        "promotion_reward_names": ("standing_success", "standing_success"),
+        "promotion_success_rates": (0.80, 0.80),
+        "evaluation_episodes": (8192, 8192),
+        "stage_termination_params": ({}, {}, {}),
+        "stage_event_params": stage_event_params,
+        "initial_stage": 0,
+        "strict_promotion": True,
+      },
+    )
+  }
+  cfg.scene.num_envs = 2048 if not play else 1
+  cfg.episode_length_s = 10.0 if not play else int(1e9)
   return cfg
